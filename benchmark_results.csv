@@ -129,3 +129,15 @@ selectcc-to-shiftand_1.ll,0,2,0,2,0,2
 selection-dag-determinism.ll,0,6,0,7,0,6
 setcc-logic_2.ll,0,4,0,4,0,8
 sext-zext-trunc.ll,0,6,0,5,0,2
+shadowcallstack.ll,3,12,3,12,0,4
+shift-amount-mod_1.ll,0,6,0,6,0,3
+shift-and.ll,0,4,0,3,0,2
+shift-int64.ll,0,2,0,2,0,2
+shift-masked-shamt_1.ll,0,7,0,6,0,4
+shifts_2.ll,0,14,0,14,0,9
+shifts_3.ll,52,14,37,14,0,10
+shl-cttz.ll,0,11,0,10,0,5
+shl-demanded.ll,0,4,0,4,0,6
+shlimm-addimm.ll,0,4,0,4,0,2
+shrinkwrap_1.ll,0,6,0,6,0,6
+sifive-interrupt-attr.ll,0,13,0,13,0,0

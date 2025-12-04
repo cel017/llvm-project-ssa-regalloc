@@ -9,8 +9,8 @@
 // REALISTIC ANALYZER:
 // 1. Calculates Base Pressure (Chordal Graph).
 // 2. Simulates ABI Constraints:
-//    - Variables live across CALLs must fit in Callee-Saved Regs (s0-s11).
-//    - If they don't fit, they SPILL, regardless of global pressure.
+//    - Variables live across CALLs must fit in Callee-Saved Regs.
+//    - If they don't fit, they SPILL.
 //
 //===----------------------------------------------------------------------===//
 
@@ -51,8 +51,6 @@ public:
     unsigned MaxPressure = 0;
     unsigned SpillCount = 0;
     unsigned TotalPhysRegs = 0;
-    // RISC-V specific: Saved Registers (s0-s11) approx 12 regs
-    // If using RV32E, this is much smaller (approx 2: s0-s1).
     unsigned CalleeSavedLimit = 12; 
   };
 
@@ -108,14 +106,16 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg)) continue; 
     
-    // Only care about Allocatable registers (GPRs)
     const TargetRegisterClass *RC = MRI->getRegClass(Reg);
-    if (!TRI->isAllocatableClass(RC)) continue;
+
+    // FIXED: Removed !TRI->isAllocatableClass(RC)
+    // Instead, we check the bitvector below.
+    BitVector Allocatable = TRI->getAllocatableSet(MF, RC);
+    if (Allocatable.none()) continue; // If 0 allocatable regs, ignore this class
 
     Intervals.push_back(&LIS->getInterval(Reg));
 
     if (ClassStats.find(RC) == ClassStats.end()) {
-      BitVector Allocatable = TRI->getAllocatableSet(MF, RC);
       ClassStats[RC].TotalPhysRegs = Allocatable.count();
       ClassStats[RC].CalleeSavedLimit = savedRegLimit;
     }
@@ -135,7 +135,7 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
     const TargetRegisterClass *RC = MRI->getRegClass(Current->reg());
     RegisterStats &Stats = ClassStats[RC];
     auto &ActiveList = ActiveIntervals[RC];
-    auto &CallList = ActiveAcrossCalls[RC]; // Track vars surviving calls
+    auto &CallList = ActiveAcrossCalls[RC]; 
 
     // 4a. Expire Old Intervals
     auto It = std::remove_if(ActiveList.begin(), ActiveList.end(),
@@ -144,7 +144,6 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
                              });
     ActiveList.erase(It, ActiveList.end());
 
-    // Also expire from the "Call List"
     auto CallIt = std::remove_if(CallList.begin(), CallList.end(),
                              [&](const LiveInterval *Active) {
                                return Active->endIndex() <= Current->beginIndex();
@@ -158,7 +157,8 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
     // 4c. Check if THIS interval crosses any Call Site
     bool crossesCall = false;
     for (SlotIndex CallIdx : CallSites) {
-      if (Current->covers(CallIdx)) {
+      // FIXED: Used liveAt() instead of covers()
+      if (Current->liveAt(CallIdx)) {
         crossesCall = true;
         break;
       }
@@ -169,30 +169,23 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
     }
 
     // --- REALISTIC PRESSURE CHECK ---
-    
-    // Metric 1: Global Pressure (Standard Chordal)
     unsigned globalPressure = ActiveList.size();
     if (globalPressure > Stats.MaxPressure) {
       Stats.MaxPressure = globalPressure;
     }
 
-    // Metric 2: ABI Bottleneck (The "Call" Penalty)
-    // If variables cross a call, they MUST fit in Callee-Saved regs.
-    // If CallList.size() > 12 (or 2 for RV32E), we MUST spill.
+    // ABI Bottleneck Check
     bool forcedSpill = false;
     if (CallList.size() > Stats.CalleeSavedLimit) {
         forcedSpill = true;
     }
 
-    // Metric 3: Standard Spill
     bool standardSpill = (globalPressure > Stats.TotalPhysRegs);
 
     if (forcedSpill || standardSpill) {
       Stats.SpillCount++;
-      
-      // Simulating a spill: Remove the oldest/best candidate from active lists
       ActiveList.pop_back(); 
-      if (forcedSpill) CallList.pop_back(); 
+      if (forcedSpill && !CallList.empty()) CallList.pop_back(); 
     }
   }
 
@@ -201,10 +194,6 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
     const TargetRegisterClass *RC = Pair.first;
     RegisterStats &Stats = Pair.second;
 
-    // Use pure MaxPressure (no artificial fixed reg addition) 
-    // This solves the weird "SSA uses more regs than Greedy" visual bug.
-    // The "Realism" is now reflected in the higher SpillCount.
-    
     errs() << "@SSA_REPORT "
            << "func=" << MF.getName() << " "
            << "spills=" << Stats.SpillCount << " "
