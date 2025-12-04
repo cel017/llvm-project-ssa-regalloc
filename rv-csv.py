@@ -16,7 +16,6 @@ TARGET_COUNT = 500
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
 def parse_requirements(file_path):
-    """Check if the file is suitable for RISC-V execution."""
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
     
@@ -42,7 +41,6 @@ def parse_requirements(file_path):
             
     if not llc_run:
         return False, None
-            
     return True, llc_run
 
 def extract_clean_command(run_line, file_path):
@@ -72,37 +70,38 @@ def count_unique_registers(asm_file):
                 unique_regs.add(m)
     return len(unique_regs)
 
-def parse_ssa_report(stderr_output):
+def parse_ssa_report(stderr_output, file_name):
     """
-    Parses the custom text report from RegAllocSSA.cpp
-    Returns: (total_theoretical_spills, max_register_pressure)
+    Parses lines like:
+    @SSA_REPORT func=main class=GPR spills=2 pressure=15
     """
     total_spills = 0
     max_pressure = 0
+    found_report = False
     
-    # Regex to catch lines from your C++ code
-    # "Theoretical Spills: 5"
-    spill_pattern = re.compile(r'Theoretical Spills:\s+(\d+)')
-    # "Max Regs Needed:    12"
-    pressure_pattern = re.compile(r'Max Regs Needed:\s+(\d+)')
+    # Regex: @SSA_REPORT .* spills=(\d+) pressure=(\d+)
+    report_pattern = re.compile(r'@SSA_REPORT.*spills=(\d+)\s+pressure=(\d+)')
 
     for line in stderr_output.splitlines():
-        s_match = spill_pattern.search(line)
-        if s_match:
-            total_spills += int(s_match.group(1))
+        match = report_pattern.search(line)
+        if match:
+            found_report = True
+            spills = int(match.group(1))
+            pressure = int(match.group(2))
             
-        p_match = pressure_pattern.search(line)
-        if p_match:
-            # We take the maximum pressure seen across any register class
-            current_p = int(p_match.group(1))
-            if current_p > max_pressure:
-                max_pressure = current_p
+            total_spills += spills
+            if pressure > max_pressure:
+                max_pressure = pressure
+
+    # Debugging: If we found no report, print stderr to see what happened
+    if not found_report:
+        print(f"\n[WARNING] No SSA report found for {file_name}. Stderr snippet:")
+        print(stderr_output[:500]) # Print first 500 chars
+        print("-" * 20)
 
     return total_spills, max_pressure
 
 def run_benchmark(file_path, run_cmd, alloc_mode):
-    """Run llc with specific allocator and gather stats."""
-    
     # Prepare command
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
@@ -112,6 +111,7 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     cmd = f"{cmd} -stats -o {TEMP_ASM}"
     
     try:
+        # Run process
         result = subprocess.run(
             cmd, 
             shell=True, 
@@ -122,17 +122,15 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     except subprocess.TimeoutExpired:
         return None, 0
 
-    if result.returncode != 0:
-        return None, 0
-
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
 
     if alloc_mode == "ssa":
-        # Parse the custom text report
-        spills, regs = parse_ssa_report(stderr_output)
+        spills, regs = parse_ssa_report(stderr_output, os.path.basename(file_path))
         return spills, regs
     else:
-        # Standard Parsing for Basic/Greedy
+        if result.returncode != 0:
+            return None, 0
+            
         spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
         spills = int(spill_match.group(1)) if spill_match else 0
         
@@ -151,15 +149,12 @@ def main():
             break     
     files = files[start_index:] + files[:start_index]
 
-    total_files = len(files)
-    print(f"Processing {total_files} files...")
+    print(f"Processing {len(files)} files...")
     
     valid_count = 0
     skipped_count = 0
     
-    # Open CSV
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
-        # UPDATED: Changed ssa_pressure to ssa_regs
         fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs', 'ssa_spills', 'ssa_regs']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -181,22 +176,21 @@ def main():
                 skipped_count += 1
                 continue
                 
-            # 1. Run Basic
+            # 1. Basic
             b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
             if b_reg is None: 
                 skipped_count += 1
                 continue 
             
-            # 2. Run Greedy
+            # 2. Greedy
             g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
             if g_reg is None: 
                 skipped_count += 1
                 continue 
             
-            # 3. Run SSA
+            # 3. SSA (New format)
             ssa_spill, ssa_regs = run_benchmark(fpath, clean_cmd, "ssa")
             
-            # Filter trivial files
             if b_reg == 0 and g_reg == 0:
                 skipped_count += 1
                 continue
@@ -208,7 +202,7 @@ def main():
                 'greedy_spills': g_spill,
                 'greedy_regs': g_reg,
                 'ssa_spills': ssa_spill,
-                'ssa_regs': ssa_regs # UPDATED
+                'ssa_regs': ssa_regs
             })
             csvfile.flush()
             valid_count += 1
