@@ -6,9 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This Analyzer calculates:
-// 1. Theoretical Spills: (Max Pressure - Available Regs)
-// 2. Realistic Register Usage: (Max Pressure + ABI/Fixed Physical Registers)
+// REALISTIC ANALYZER:
+// 1. Calculates Base Pressure (Chordal Graph).
+// 2. Simulates ABI Constraints:
+//    - Variables live across CALLs must fit in Callee-Saved Regs (s0-s11).
+//    - If they don't fit, they SPILL, regardless of global pressure.
 //
 //===----------------------------------------------------------------------===//
 
@@ -49,7 +51,9 @@ public:
     unsigned MaxPressure = 0;
     unsigned SpillCount = 0;
     unsigned TotalPhysRegs = 0;
-    unsigned FixedPhysRegsTouched = 0; // New metric for realism
+    // RISC-V specific: Saved Registers (s0-s11) approx 12 regs
+    // If using RV32E, this is much smaller (approx 2: s0-s1).
+    unsigned CalleeSavedLimit = 12; 
   };
 
   bool runOnMachineFunction(MachineFunction &MF) override;
@@ -84,28 +88,17 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
   std::map<const TargetRegisterClass *, RegisterStats> ClassStats;
   std::vector<const LiveInterval *> Intervals;
 
-  // --- STEP 1: Count Fixed Physical Registers (The "ABI Reality" check) ---
-  // This detects registers like a0-a7, ra, sp that are explicitly used 
-  // by instructions, even if they aren't "virtual" registers.
-  std::map<const TargetRegisterClass *, std::set<MCRegister>> FixedUsage;
-  
+  // --- STEP 0: Configure Limits based on Architecture ---
+  // If RV32E is detected (16 regs total), the saved pool is tiny.
+  bool isRV32E = MF.getSubtarget().getFeatureString().contains("+e");
+  unsigned savedRegLimit = isRV32E ? 2 : 12; // s0-s1 vs s0-s11
+
+  // --- STEP 1: Find all Call Sites ---
+  std::vector<SlotIndex> CallSites;
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
-      for (const MachineOperand &MO : MI.operands()) {
-        if (MO.isReg() && MO.getReg().isPhysical()) {
-          Register Reg = MO.getReg();
-          // Skip the zero register (x0) or PC as they don't count towards allocation
-          if (Reg == 0) continue; 
-          
-          // Find which class this register belongs to
-          for (const TargetRegisterClass *RC : TRI->regclasses()) {
-            if (RC->contains(Reg)) {
-              FixedUsage[RC].insert(Reg);
-              // Break after finding the smallest/most specific class? 
-              // Actually, simplified: we assign it to the class we are analyzing later.
-            }
-          }
-        }
+      if (MI.isCall()) {
+        CallSites.push_back(LIS->getInstructionIndex(MI));
       }
     }
   }
@@ -114,12 +107,17 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg)) continue; 
+    
+    // Only care about Allocatable registers (GPRs)
+    const TargetRegisterClass *RC = MRI->getRegClass(Reg);
+    if (!TRI->isAllocatableClass(RC)) continue;
+
     Intervals.push_back(&LIS->getInterval(Reg));
 
-    const TargetRegisterClass *RC = MRI->getRegClass(Reg);
     if (ClassStats.find(RC) == ClassStats.end()) {
       BitVector Allocatable = TRI->getAllocatableSet(MF, RC);
       ClassStats[RC].TotalPhysRegs = Allocatable.count();
+      ClassStats[RC].CalleeSavedLimit = savedRegLimit;
     }
   }
 
@@ -129,67 +127,88 @@ void RASSA::simulateChordalAllocation(MachineFunction &MF) {
               return A->beginIndex() < B->beginIndex();
             });
 
-  // --- STEP 4: Simulate Pressure ---
+  // --- STEP 4: Simulation ---
   std::map<const TargetRegisterClass *, std::vector<const LiveInterval *>> ActiveIntervals;
+  std::map<const TargetRegisterClass *, std::vector<const LiveInterval *>> ActiveAcrossCalls;
 
   for (const LiveInterval *Current : Intervals) {
     const TargetRegisterClass *RC = MRI->getRegClass(Current->reg());
     RegisterStats &Stats = ClassStats[RC];
     auto &ActiveList = ActiveIntervals[RC];
+    auto &CallList = ActiveAcrossCalls[RC]; // Track vars surviving calls
 
-    // Remove dead
+    // 4a. Expire Old Intervals
     auto It = std::remove_if(ActiveList.begin(), ActiveList.end(),
                              [&](const LiveInterval *Active) {
                                return Active->endIndex() <= Current->beginIndex();
                              });
     ActiveList.erase(It, ActiveList.end());
 
-    // Add new
+    // Also expire from the "Call List"
+    auto CallIt = std::remove_if(CallList.begin(), CallList.end(),
+                             [&](const LiveInterval *Active) {
+                               return Active->endIndex() <= Current->beginIndex();
+                             });
+    CallList.erase(CallIt, CallList.end());
+
+
+    // 4b. Add New Interval
     ActiveList.push_back(Current);
 
-    // Update Max Pressure
-    unsigned currentPressure = ActiveList.size();
-    if (currentPressure > Stats.MaxPressure) {
-      Stats.MaxPressure = currentPressure;
+    // 4c. Check if THIS interval crosses any Call Site
+    bool crossesCall = false;
+    for (SlotIndex CallIdx : CallSites) {
+      if (Current->covers(CallIdx)) {
+        crossesCall = true;
+        break;
+      }
     }
 
-    // Spill check
-    if (currentPressure > Stats.TotalPhysRegs) {
+    if (crossesCall) {
+        CallList.push_back(Current);
+    }
+
+    // --- REALISTIC PRESSURE CHECK ---
+    
+    // Metric 1: Global Pressure (Standard Chordal)
+    unsigned globalPressure = ActiveList.size();
+    if (globalPressure > Stats.MaxPressure) {
+      Stats.MaxPressure = globalPressure;
+    }
+
+    // Metric 2: ABI Bottleneck (The "Call" Penalty)
+    // If variables cross a call, they MUST fit in Callee-Saved regs.
+    // If CallList.size() > 12 (or 2 for RV32E), we MUST spill.
+    bool forcedSpill = false;
+    if (CallList.size() > Stats.CalleeSavedLimit) {
+        forcedSpill = true;
+    }
+
+    // Metric 3: Standard Spill
+    bool standardSpill = (globalPressure > Stats.TotalPhysRegs);
+
+    if (forcedSpill || standardSpill) {
       Stats.SpillCount++;
+      
+      // Simulating a spill: Remove the oldest/best candidate from active lists
       ActiveList.pop_back(); 
+      if (forcedSpill) CallList.pop_back(); 
     }
   }
 
-  // --- STEP 5: Output Realistic Stats ---
+  // --- STEP 5: Output ---
   for (auto &Pair : ClassStats) {
     const TargetRegisterClass *RC = Pair.first;
     RegisterStats &Stats = Pair.second;
 
-    // Estimate Fixed registers used for this class
-    // We take a rough count of physical registers encountered in the code
-    unsigned fixedCount = 0;
-    // Iterate our FixedUsage map. If the fixed reg is allocatable in this class, count it.
-    for (auto &Entry : FixedUsage) {
-       const TargetRegisterClass *FixedRC = Entry.first;
-       if (FixedRC == RC || RC->hasSuperClass(FixedRC) || FixedRC->hasSubClass(RC)) {
-           // Simple heuristic: Take the set size if it matches class
-           if (Entry.second.size() > fixedCount) fixedCount = Entry.second.size();
-       }
-    }
-
-    // REALISM FORMULA: Max VReg Pressure + Fixed Physical Registers Used
-    unsigned realisticRegs = Stats.MaxPressure + fixedCount;
-
-    // Cap it at TotalPhysRegs so we don't report using 40 registers on a 32-register machine
-    // (unless we spilled, but 'regs used' usually implies distinct hardware regs)
-    if (realisticRegs > Stats.TotalPhysRegs && Stats.SpillCount == 0) {
-        realisticRegs = Stats.TotalPhysRegs; 
-    }
-
+    // Use pure MaxPressure (no artificial fixed reg addition) 
+    // This solves the weird "SSA uses more regs than Greedy" visual bug.
+    // The "Realism" is now reflected in the higher SpillCount.
+    
     errs() << "@SSA_REPORT "
            << "func=" << MF.getName() << " "
            << "spills=" << Stats.SpillCount << " "
-           << "pressure=" << realisticRegs << "\n";
+           << "pressure=" << Stats.MaxPressure << "\n";
   }
   errs().flush(); 
 }
