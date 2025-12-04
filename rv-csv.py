@@ -51,14 +51,9 @@ def extract_clean_command(run_line, file_path):
         return None
     cmd_str = match.group(1)
     
-    # 1. Remove existing architecture flags
-    cmd_str = re.sub(r'-mtriple=\S+', '', cmd_str)
-    cmd_str = re.sub(r'-mattr=\S+', '', cmd_str)
-    cmd_str = re.sub(r'-target-abi=\S+', '', cmd_str) # Strip existing ABI if present
-    
-    # 2. Inject RV32E (Embedded) to force high register pressure (16 GPRs)
-    # Added -target-abi=ilp32e so the compiler knows not to use a6/a7 for args
-    cmd_str = f"{cmd_str} -mtriple=riscv32 -mattr=+e -target-abi=ilp32e"
+    # --- CHANGED: Native Mode ---
+    # Since the host is RISC-V, we trust the file's original command entirely.
+    # We do NOT strip -mtriple or inject anything.
     
     cmd_str = cmd_str.replace('%s', f'"{file_path}"')
     return cmd_str.strip()
@@ -110,9 +105,10 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
-    # --- CHANGED: Sort A-Z, then rotate to start at 'r' ---
+    # Sort A-Z
     files.sort()
     
+    # Rotate list to start at 'r'
     start_index = 0
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath).lower()
@@ -122,10 +118,9 @@ def main():
             
     # Rotate list: [r..., z, a..., q]
     files = files[start_index:] + files[:start_index]
-    # -----------------------------------------------------
 
     total_files = len(files)
-    print(f"Found {total_files} .ll files. Processing for RISC-V (RV32E).")
+    print(f"Found {total_files} .ll files. Processing for Native RISC-V.")
     
     valid_count = 0
     
