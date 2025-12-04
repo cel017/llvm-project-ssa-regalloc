@@ -6,7 +6,7 @@ import sys
 import csv
 
 # Configuration
-LLC_CMD = "build_rv1/bin/llc"
+LLC_CMD = "/build_rv1/bin/llc"
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
