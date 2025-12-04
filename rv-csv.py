@@ -6,7 +6,7 @@ import sys
 import csv
 
 # Configuration
-LLC_CMD = "llc"
+LLC_CMD = "build-rv1/lib/llc"
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
@@ -58,11 +58,10 @@ def extract_clean_command(run_line, file_path):
     if not match:
         return None
     cmd_str = match.group(1)
-    
-    # --- CHANGED: Native Mode ---
-    # Since the host is RISC-V, we trust the file's original command entirely.
-    # We do NOT strip -mtriple or inject anything.
-    
+
+    # Replace the leading 'llc' with our configured LLC_CMD
+    cmd_str = re.sub(r'^\s*llc\b', LLC_CMD, cmd_str)
+
     cmd_str = cmd_str.replace('%s', f'"{file_path}"')
     return cmd_str.strip()
 
