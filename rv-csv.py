@@ -12,6 +12,11 @@ TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
+# --- NEW CONFIG: Increase Pressure ---
+# "-mattr=+e" enables the RISC-V Embedded extension.
+# This reduces the available GPRs from 32 down to 16, forcing high pressure.
+LLC_MATTR = "-mattr=+e" 
+
 # Regex for RISC-V registers
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
@@ -95,20 +100,21 @@ def parse_ssa_report(stderr_output, file_name):
 
     # Debugging: If we found no report, print stderr to see what happened
     if not found_report:
-        print(f"\n[WARNING] No SSA report found for {file_name}. Stderr snippet:")
-        print(stderr_output[:500]) # Print first 500 chars
-        print("-" * 20)
+        # Optional: Uncomment if you want to see errors for failed files
+        # print(f"\n[WARNING] No SSA report found for {file_name}")
+        pass
 
     return total_spills, max_pressure
 
 def run_benchmark(file_path, run_cmd, alloc_mode):
-    # Prepare command
+    # Prepare command with Allocator
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
     else:
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
-        
-    cmd = f"{cmd} -stats -o {TEMP_ASM}"
+    
+    # --- CHANGE: Inject the MATTR flag to increase pressure ---
+    cmd = f"{cmd} {LLC_MATTR} -stats -o {TEMP_ASM}"
     
     try:
         # Run process
@@ -149,7 +155,7 @@ def main():
             break     
     files = files[start_index:] + files[:start_index]
 
-    print(f"Processing {len(files)} files...")
+    print(f"Processing {len(files)} files with high pressure ({LLC_MATTR})...")
     
     valid_count = 0
     skipped_count = 0
@@ -191,6 +197,7 @@ def main():
             # 3. SSA (New format)
             ssa_spill, ssa_regs = run_benchmark(fpath, clean_cmd, "ssa")
             
+            # Filter trivial files
             if b_reg == 0 and g_reg == 0:
                 skipped_count += 1
                 continue
