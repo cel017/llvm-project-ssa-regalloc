@@ -109,7 +109,20 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
 
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
-    files.sort(reverse=True) # Z -> A processing
+    
+    # --- CHANGED: Sort A-Z, then rotate to start at 'r' ---
+    files.sort()
+    
+    start_index = 0
+    for i, fpath in enumerate(files):
+        fname = os.path.basename(fpath).lower()
+        if fname >= 'r':
+            start_index = i
+            break
+            
+    # Rotate list: [r..., z, a..., q]
+    files = files[start_index:] + files[:start_index]
+    # -----------------------------------------------------
 
     total_files = len(files)
     print(f"Found {total_files} .ll files. Processing for RISC-V (RV32E).")
