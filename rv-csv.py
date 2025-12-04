@@ -4,9 +4,11 @@ import glob
 import subprocess
 import sys
 import csv
+import shutil
 
 # Configuration
-LLC_CMD = "/build_rv1/bin/llc"
+# Path to the specific custom build of llc
+LLC_CMD = os.path.abspath("build_rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
@@ -64,17 +66,20 @@ def extract_clean_command(run_line, file_path):
     """Clean the RUN line to get a standalone llc command for RISC-V."""
     filename = os.path.basename(file_path)
     # 1. Stop at pipes (|) or redirects (>)
-    # Note: We explicitly do NOT stop at < because we want to capture < %s to clean it up
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
         log_skip(filename, "Could not parse llc command from RUN line")
         return None
     cmd_str = match.group(1)
+
+    # 2. Replace generic 'llc' with the absolute path found on system
+    if cmd_str.startswith("llc"):
+        cmd_str = LLC_CMD + cmd_str[3:]
     
-    # 2. CRITICAL FIX: Remove trailing backslashes that cause shell to hang
+    # 3. CRITICAL FIX: Remove trailing backslashes that cause shell to hang
     cmd_str = cmd_str.replace('\\', ' ')
     
-    # 3. Handle input file replacement
+    # 4. Handle input file replacement
     # Some tests use "< %s". llc accepts "llc file.ll". 
     # We replace "< %s" with just the filename, effectively converting redirect to arg.
     if '< %s' in cmd_str:
@@ -133,6 +138,11 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     return spills, regs
 
 def main():
+    if not os.path.exists(LLC_CMD):
+        print(f"Error: Custom 'llc' not found at: {LLC_CMD}")
+        print("Please check the path to your build_rv1 folder.")
+        sys.exit(1)
+        
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
     files.sort(key=lambda x: os.path.basename(x).lower())
@@ -149,6 +159,7 @@ def main():
     total_files = len(files)
     start_file_name = os.path.basename(files[0]) if files else "None"
     print(f"Found {total_files} .ll files. Processing for Native RISC-V.")
+    print(f"Using LLC: {LLC_CMD}")
     print(f"Starting at file: {start_file_name}")
     
     valid_count = 0
