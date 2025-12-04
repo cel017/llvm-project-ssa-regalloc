@@ -230,6 +230,9 @@ LLVM_ABI FunctionPass *createFastRegisterAllocator(RegAllocFilterFunc F,
 LLVM_ABI FunctionPass *createBasicRegisterAllocator();
 LLVM_ABI FunctionPass *createBasicRegisterAllocator(RegAllocFilterFunc F);
 
+LLVM_ABI FunctionPass *createSSARegisterAllocator();
+LLVM_ABI FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc F);
+
 /// Greedy register allocation pass - This pass implements a global register
 /// allocator for optimized builds.
 ///
