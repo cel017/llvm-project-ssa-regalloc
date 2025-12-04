@@ -12,7 +12,7 @@ LLC_CMD = os.path.abspath("build_rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
-TARGET_COUNT = 500  # Stop after this many successful tests
+TARGET_COUNT = 2000  # Stop after this many successful tests
 
 # Regex for RISC-V registers (ABI names and Architectural names)
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
