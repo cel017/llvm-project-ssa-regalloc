@@ -6,7 +6,7 @@ import sys
 import csv
 
 # Configuration
-LLC_CMD = os.path.abspath("build_rv1/bin/llc")
+LLC_CMD = os.path.abspath("build-rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
@@ -73,7 +73,7 @@ def extract_clean_command(run_line, file_path):
         cmd_str = cmd_str.replace('< %s', f'"{file_path}"')
     else:
         cmd_str = cmd_str.replace('%s', f'"{file_path}"')
-        
+
     return cmd_str.strip()
 
 def count_unique_registers(asm_file):
