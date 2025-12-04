@@ -8,10 +8,10 @@ redundant-vfmvsf.ll,,0,0,2
 rem_3.ll,,0,0,6
 repeated-fp-divisors_1.ll,,0,0,7
 reserved-regs_1.ll,,0,37,29
-ret0_1.ll,,0,0,1
-ret42.ll,,0,0,1
-ret_1.ll,,0,0,4
-rnmi-interrupt-attr.ll,,0,0,17
+ret0_1.ll,0,1,0,1
+ret42.ll,0,1,0,1
+ret_1.ll,0,4,0,4
+rnmi-interrupt-attr.ll,0,17,0,17
 rotl-rotr_1.ll,,0,0,10
 rotl-rotr_3.ll,,0,0,15
 rv32-inline-asm-pairs.ll,,0,0,5
@@ -52,11 +52,11 @@ rv64-float-convert-strict.ll,,0,0,2
 rv64-float-convert.ll,,0,0,12
 rv64-float-convert_1.ll,,0,0,2
 rv64-inline-asm-pairs.ll,,0,0,5
-rv64-large-stack.ll,,0,0,3
+rv64-large-stack.ll,0,3,0,3
 rv64-patchpoint.ll,,0,0,6
-rv64-stackmap-frame-setup.ll,,0,0,2
+rv64-stackmap-frame-setup.ll,0,2,0,2
 rv64-stackmap.ll,,0,5,27
-rv64-statepoint-call-lowering-x1.ll,,0,0,3
+rv64-statepoint-call-lowering-x1.ll,0,3,0,3
 rv64-statepoint-call-lowering-x2.ll,,0,0,6
 rv64-statepoint-call-lowering.ll,,0,0,7
 rv64d-double-convert.ll,,0,0,2
@@ -100,7 +100,3 @@ rv64zksed-intrinsic-autoupgrade.ll,,0,0,2
 rv64zksed-intrinsic-autoupgrade2.ll,,0,0,2
 rv64zksed-intrinsic.ll,,0,0,2
 rv64zksh-intrinsic-autoupgrade.ll,,0,0,1
-rv64zksh-intrinsic.ll,,0,0,1
-rvv-cfi-info.ll,,0,0,4
-rvv-framelayout.ll,,0,0,9
-rvv-peephole-vmerge-masked-vops.ll,,0,0,3

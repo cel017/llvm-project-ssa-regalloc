@@ -10,10 +10,9 @@ LLC_CMD = os.path.abspath("build_rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
-TARGET_COUNT = 500  # Stop after this many successful tests
+TARGET_COUNT = 500  
 
-# Regex for RISC-V registers (ABI names and Architectural names)
-# FIXED: Correctly matches x0-x31, f0-f31 by grouping the numbers with the prefix.
+# Regex for RISC-V registers
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
 def parse_requirements(file_path):
@@ -21,7 +20,6 @@ def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
     
-    # 1. Check REQUIRES line
     requires_line = re.search(r';\s*REQUIRES:\s*(.*)', content)
     if requires_line:
         reqs = requires_line.group(1).lower()
@@ -30,20 +28,15 @@ def parse_requirements(file_path):
             if arch in reqs:
                 return False, None
     
-    # 2. Extract RUN command and check -mtriple
     run_lines = re.findall(r';\s*RUN:\s*(.*)', content)
     llc_run = None
     for line in run_lines:
         if 'llc' in line:
-            # Check if this specific RUN line targets a non-RISCV architecture
-            # Matches -mtriple=x86_64, -mtriple=arm, etc.
             triple_match = re.search(r'-mtriple=([a-zA-Z0-9_]+)', line)
             if triple_match:
                 arch = triple_match.group(1).lower()
-                # If triple is present but NOT riscv, skip it
                 if 'riscv' not in arch:
-                    continue # Skip this RUN line, look for another
-            
+                    continue
             llc_run = line
             break
             
@@ -53,31 +46,20 @@ def parse_requirements(file_path):
     return True, llc_run
 
 def extract_clean_command(run_line, file_path):
-    """Clean the RUN line to get a standalone llc command for RISC-V."""
-    # 1. Stop at pipes (|) or redirects (>)
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
-        delete_and_skip(file_path)
         return None
     cmd_str = match.group(1)
-
-    # 2. Replace generic 'llc' with the absolute path found on system
     if cmd_str.startswith("llc"):
         cmd_str = LLC_CMD + cmd_str[3:]
-    
-    # 3. CRITICAL FIX: Remove trailing backslashes that cause shell to hang
     cmd_str = cmd_str.replace('\\', ' ')
-    
-    # 4. Handle input file replacement
     if '< %s' in cmd_str:
         cmd_str = cmd_str.replace('< %s', f'"{file_path}"')
     else:
         cmd_str = cmd_str.replace('%s', f'"{file_path}"')
-
     return cmd_str.strip()
 
 def count_unique_registers(asm_file):
-    """Parse .s file and count unique physical registers used."""
     if not os.path.exists(asm_file):
         return 0
     unique_regs = set()
@@ -90,8 +72,38 @@ def count_unique_registers(asm_file):
                 unique_regs.add(m)
     return len(unique_regs)
 
+def parse_ssa_report(stderr_output):
+    """
+    Parses the custom text report from RegAllocSSA.cpp
+    Returns: (total_theoretical_spills, max_register_pressure)
+    """
+    total_spills = 0
+    max_pressure = 0
+    
+    # Regex to catch lines from your C++ code
+    # "Theoretical Spills: 5"
+    spill_pattern = re.compile(r'Theoretical Spills:\s+(\d+)')
+    # "Max Regs Needed:    12"
+    pressure_pattern = re.compile(r'Max Regs Needed:\s+(\d+)')
+
+    for line in stderr_output.splitlines():
+        s_match = spill_pattern.search(line)
+        if s_match:
+            total_spills += int(s_match.group(1))
+            
+        p_match = pressure_pattern.search(line)
+        if p_match:
+            # We take the maximum pressure seen across any register class
+            current_p = int(p_match.group(1))
+            if current_p > max_pressure:
+                max_pressure = current_p
+
+    return total_spills, max_pressure
+
 def run_benchmark(file_path, run_cmd, alloc_mode):
     """Run llc with specific allocator and gather stats."""
+    
+    # Prepare command
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
     else:
@@ -114,39 +126,41 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
         return None, 0
 
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
-    spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
-    spills = int(spill_match.group(1)) if spill_match else 0
-    regs = count_unique_registers(TEMP_ASM)
-    
-    return spills, regs
+
+    if alloc_mode == "ssa":
+        # Parse the custom text report
+        spills, regs = parse_ssa_report(stderr_output)
+        return spills, regs
+    else:
+        # Standard Parsing for Basic/Greedy
+        spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
+        spills = int(spill_match.group(1)) if spill_match else 0
+        
+        regs = count_unique_registers(TEMP_ASM)
+        return spills, regs
 
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
-    
-    # --- CHANGED: Case-Insensitive Sort ---
     files.sort(key=lambda x: os.path.basename(x).lower())
     
-    # Rotate list to start at 'r'
     start_index = 0
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath).lower()
         if fname >= 'r':
             start_index = i
-            break
-            
+            break     
     files = files[start_index:] + files[:start_index]
 
     total_files = len(files)
-    start_file_name = os.path.basename(files[0]) if files else "None"
-    print(f"Found {total_files} .ll files. Processing for Native RISC-V.")
-    print(f"Starting at file: {start_file_name}")
+    print(f"Processing {total_files} files...")
     
     valid_count = 0
     skipped_count = 0
     
-    # Open CSV for writing
+    # Open CSV
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
-        fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs']
+        # UPDATED: Changed ssa_pressure to ssa_regs
+        fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs', 'ssa_spills', 'ssa_regs']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         
@@ -154,8 +168,7 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            # Show skipped count to confirm script is working
-            sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT} | Skipped: {skipped_count}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
+            sys.stdout.write(f"\r[Collected: {valid_count} | Skipped: {skipped_count}] {os.path.basename(fpath)}...    ")
             sys.stdout.flush()
             
             valid, run_line = parse_requirements(fpath)
@@ -168,36 +181,39 @@ def main():
                 skipped_count += 1
                 continue
                 
-            # Run Basic
+            # 1. Run Basic
             b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
             if b_reg is None: 
                 skipped_count += 1
                 continue 
             
-            # Run Greedy
+            # 2. Run Greedy
             g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
             if g_reg is None: 
                 skipped_count += 1
                 continue 
+            
+            # 3. Run SSA
+            ssa_spill, ssa_regs = run_benchmark(fpath, clean_cmd, "ssa")
             
             # Filter trivial files
             if b_reg == 0 and g_reg == 0:
                 skipped_count += 1
                 continue
                 
-            # Write row immediately
             writer.writerow({
                 'filename': os.path.basename(fpath),
                 'basic_spills': b_spill,
                 'basic_regs': b_reg,
                 'greedy_spills': g_spill,
-                'greedy_regs': g_reg
+                'greedy_regs': g_reg,
+                'ssa_spills': ssa_spill,
+                'ssa_regs': ssa_regs # UPDATED
             })
-            csvfile.flush() # Ensure data is saved if script crashes
+            csvfile.flush()
             valid_count += 1
             
-    print(f"\n\nDone! Saved {valid_count} records to {OUTPUT_CSV}")
-    
+    print(f"\n\nDone! Saved to {OUTPUT_CSV}")
     if os.path.exists(TEMP_ASM):
         os.remove(TEMP_ASM)
 
