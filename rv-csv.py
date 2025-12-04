@@ -6,7 +6,7 @@ import sys
 import csv
 
 # Configuration
-LLC_CMD = "build-rv1/lib/llc"
+LLC_CMD = os.path.abspath("build_rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
@@ -54,15 +54,26 @@ def parse_requirements(file_path):
 
 def extract_clean_command(run_line, file_path):
     """Clean the RUN line to get a standalone llc command for RISC-V."""
+    # 1. Stop at pipes (|) or redirects (>)
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
+        delete_and_skip(file_path)
         return None
     cmd_str = match.group(1)
 
-    # Replace the leading 'llc' with our configured LLC_CMD
-    cmd_str = re.sub(r'^\s*llc\b', LLC_CMD, cmd_str)
-
-    cmd_str = cmd_str.replace('%s', f'"{file_path}"')
+    # 2. Replace generic 'llc' with the absolute path found on system
+    if cmd_str.startswith("llc"):
+        cmd_str = LLC_CMD + cmd_str[3:]
+    
+    # 3. CRITICAL FIX: Remove trailing backslashes that cause shell to hang
+    cmd_str = cmd_str.replace('\\', ' ')
+    
+    # 4. Handle input file replacement
+    if '< %s' in cmd_str:
+        cmd_str = cmd_str.replace('< %s', f'"{file_path}"')
+    else:
+        cmd_str = cmd_str.replace('%s', f'"{file_path}"')
+        
     return cmd_str.strip()
 
 def count_unique_registers(asm_file):
