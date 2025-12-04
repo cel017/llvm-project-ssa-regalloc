@@ -13,34 +13,42 @@ OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  # Stop after this many successful tests
 
 # Regex for RISC-V registers (ABI names and Architectural names)
-# Matches: x0-x31, f0-f31, a0-a7, s0-s11, t0-t6, sp, ra, gp, tp, zero
-REG_PATTERN = re.compile(r'\b(?:x[0-9]|[1-2][0-9]|3[0-1]|f[0-9]|[1-2][0-9]|3[0-1]|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
+# FIXED: Correctly matches x0-x31, f0-f31 by grouping the numbers with the prefix.
+REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
 def parse_requirements(file_path):
     """Check if the file is suitable for RISC-V execution."""
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
     
-    # Check REQUIRES
-    # We strictly look for riscv support or generic tests
+    # 1. Check REQUIRES line
     requires_line = re.search(r';\s*REQUIRES:\s*(.*)', content)
     if requires_line:
         reqs = requires_line.group(1).lower()
-        # If it explicitly requires another arch, skip it
         forbidden = ['x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon', 'nvptx', 'amdgpu', 'systemz', 'wasm']
         for arch in forbidden:
             if arch in reqs:
                 return False, None
-        # Optional: Force it to have 'riscv' if your folder is mixed
-        # if 'riscv' not in reqs: return False, None
     
-    # Extract RUN command
+    # 2. Extract RUN command and check -mtriple
     run_lines = re.findall(r';\s*RUN:\s*(.*)', content)
     llc_run = None
     for line in run_lines:
         if 'llc' in line:
+            # Check if this specific RUN line targets a non-RISCV architecture
+            # Matches -mtriple=x86_64, -mtriple=arm, etc.
+            triple_match = re.search(r'-mtriple=([a-zA-Z0-9_]+)', line)
+            if triple_match:
+                arch = triple_match.group(1).lower()
+                # If triple is present but NOT riscv, skip it
+                if 'riscv' not in arch:
+                    continue # Skip this RUN line, look for another
+            
             llc_run = line
             break
+            
+    if not llc_run:
+        return False, None
             
     return True, llc_run
 
@@ -106,7 +114,6 @@ def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
     # --- CHANGED: Case-Insensitive Sort ---
-    # This prevents Uppercase files (ASCII < 97) from splitting the list
     files.sort(key=lambda x: os.path.basename(x).lower())
     
     # Rotate list to start at 'r'
@@ -125,6 +132,7 @@ def main():
     print(f"Starting at file: {start_file_name}")
     
     valid_count = 0
+    skipped_count = 0
     
     # Open CSV for writing
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
@@ -136,27 +144,35 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
+            # Show skipped count to confirm script is working
+            sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT} | Skipped: {skipped_count}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
             sys.stdout.flush()
             
             valid, run_line = parse_requirements(fpath)
             if not valid or not run_line:
+                skipped_count += 1
                 continue
                 
             clean_cmd = extract_clean_command(run_line, fpath)
             if not clean_cmd:
+                skipped_count += 1
                 continue
                 
             # Run Basic
             b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
-            if b_reg is None: continue 
+            if b_reg is None: 
+                skipped_count += 1
+                continue 
             
             # Run Greedy
             g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
-            if g_reg is None: continue 
+            if g_reg is None: 
+                skipped_count += 1
+                continue 
             
             # Filter trivial files
             if b_reg == 0 and g_reg == 0:
+                skipped_count += 1
                 continue
                 
             # Write row immediately
