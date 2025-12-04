@@ -17,9 +17,6 @@ TARGET_COUNT = 500  # Stop after this many successful tests
 # Regex for RISC-V registers (ABI names and Architectural names)
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
-def log_skip(filename, reason):
-    pass
-
 def parse_requirements(file_path):
     """Check if the file is suitable for RISC-V execution."""
     filename = os.path.basename(file_path)
@@ -33,7 +30,6 @@ def parse_requirements(file_path):
         forbidden = ['x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon', 'nvptx', 'amdgpu', 'systemz', 'wasm']
         for arch in forbidden:
             if arch in reqs:
-                log_skip(filename, f"REQUIRES forbidden arch '{arch}'")
                 return False, None
     
     # 2. Extract RUN command and check -mtriple
@@ -47,14 +43,12 @@ def parse_requirements(file_path):
                 arch = triple_match.group(1).lower()
                 # If explicit triple exists, it MUST contain 'riscv'
                 if 'riscv' not in arch:
-                    # Don't log skip yet, just look for another RUN line
                     continue 
             
             llc_run = line
             break
             
     if not llc_run:
-        log_skip(filename, "No valid RISC-V 'llc' RUN line found")
         return False, None
             
     return True, llc_run
@@ -65,7 +59,6 @@ def extract_clean_command(run_line, file_path):
     # 1. Stop at pipes (|) or redirects (>)
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
-        log_skip(filename, "Could not parse llc command from RUN line")
         return None
     cmd_str = match.group(1)
 
@@ -119,12 +112,9 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
             timeout=5 
         )
     except subprocess.TimeoutExpired:
-        log_skip(filename, f"Timeout during {alloc_mode} allocation")
         return None, 0
 
     if result.returncode != 0:
-        stderr_msg = result.stderr.decode('utf-8', errors='ignore').split('\n')[0]
-        log_skip(filename, f"Crash/Error during {alloc_mode}: {stderr_msg[:50]}...")
         return None, 0
 
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
@@ -142,15 +132,19 @@ def main():
         
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
-    files.sort(key=lambda x: os.path.basename(x).lower())
+    # Sort files in Reverse Alphabetical order (Z -> A)
+    files.sort(key=lambda x: os.path.basename(x).lower(), reverse=True)
     
+    # Find the first file starting with 'r'
     start_index = 0
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath).lower()
-        if fname >= 'r':
+        if fname.startswith('r'):
             start_index = i
             break
             
+    # Rotate list to start at R
+    # Sequence will be: [R... -> A... -> Z... -> S...]
     files = files[start_index:] + files[:start_index]
 
     total_files = len(files)
@@ -158,6 +152,7 @@ def main():
     print(f"Found {total_files} .ll files. Processing for Native RISC-V.")
     print(f"Using LLC: {LLC_CMD}")
     print(f"Starting at file: {start_file_name}")
+    print("Processing order: Reverse Alphabetical (Z->A), starting at 'R'")
     
     valid_count = 0
     skipped_count = 0
@@ -197,7 +192,6 @@ def main():
                 continue 
             
             if b_reg == 0 and g_reg == 0:
-                log_skip(os.path.basename(fpath), "Trivial test (0 registers used)")
                 skipped_count += 1
                 continue
                 
