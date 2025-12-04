@@ -17,9 +17,16 @@ TARGET_COUNT = 500  # Stop after this many successful tests
 # Regex for RISC-V registers (ABI names and Architectural names)
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
+def delete_and_skip(file_path):
+    """Silently deletes the file."""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError:
+        pass
+
 def parse_requirements(file_path):
     """Check if the file is suitable for RISC-V execution."""
-    filename = os.path.basename(file_path)
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
     
@@ -30,6 +37,7 @@ def parse_requirements(file_path):
         forbidden = ['x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon', 'nvptx', 'amdgpu', 'systemz', 'wasm']
         for arch in forbidden:
             if arch in reqs:
+                delete_and_skip(file_path)
                 return False, None
     
     # 2. Extract RUN command and check -mtriple
@@ -49,16 +57,17 @@ def parse_requirements(file_path):
             break
             
     if not llc_run:
+        delete_and_skip(file_path)
         return False, None
             
     return True, llc_run
 
 def extract_clean_command(run_line, file_path):
     """Clean the RUN line to get a standalone llc command for RISC-V."""
-    filename = os.path.basename(file_path)
     # 1. Stop at pipes (|) or redirects (>)
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
+        delete_and_skip(file_path)
         return None
     cmd_str = match.group(1)
 
@@ -70,8 +79,6 @@ def extract_clean_command(run_line, file_path):
     cmd_str = cmd_str.replace('\\', ' ')
     
     # 4. Handle input file replacement
-    # Some tests use "< %s". llc accepts "llc file.ll". 
-    # We replace "< %s" with just the filename, effectively converting redirect to arg.
     if '< %s' in cmd_str:
         cmd_str = cmd_str.replace('< %s', f'"{file_path}"')
     else:
@@ -95,7 +102,6 @@ def count_unique_registers(asm_file):
 
 def run_benchmark(file_path, run_cmd, alloc_mode):
     """Run llc with specific allocator and gather stats."""
-    filename = os.path.basename(file_path)
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
     else:
@@ -112,9 +118,11 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
             timeout=5 
         )
     except subprocess.TimeoutExpired:
+        delete_and_skip(file_path)
         return None, 0
 
     if result.returncode != 0:
+        delete_and_skip(file_path)
         return None, 0
 
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
@@ -144,7 +152,6 @@ def main():
             break
             
     # Rotate list to start at R
-    # Sequence will be: [R... -> A... -> Z... -> S...]
     files = files[start_index:] + files[:start_index]
 
     total_files = len(files)
@@ -155,7 +162,6 @@ def main():
     print("Processing order: Reverse Alphabetical (Z->A), starting at 'R'")
     
     valid_count = 0
-    skipped_count = 0
     
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs']
@@ -166,33 +172,33 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT} | Skipped: {skipped_count}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
+            sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
             sys.stdout.flush()
             
             valid, run_line = parse_requirements(fpath)
             if not valid or not run_line:
-                skipped_count += 1
+                # File deleted inside parse_requirements
                 continue
                 
             clean_cmd = extract_clean_command(run_line, fpath)
             if not clean_cmd:
-                skipped_count += 1
+                # File deleted inside extract_clean_command
                 continue
                 
             # Run Basic
             b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
             if b_reg is None: 
-                skipped_count += 1
+                # File deleted inside run_benchmark
                 continue 
             
             # Run Greedy
             g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
             if g_reg is None: 
-                skipped_count += 1
+                # File deleted inside run_benchmark
                 continue 
             
             if b_reg == 0 and g_reg == 0:
-                skipped_count += 1
+                delete_and_skip(fpath)
                 continue
                 
             writer.writerow({
