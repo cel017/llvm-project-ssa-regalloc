@@ -93,7 +93,7 @@ def main():
     z_values = [zeros_b, zeros_g, zeros_s]
 
     bars2 = axs[0, 1].bar(labels, z_values, color=colors)
-    axs[0, 1].set_title('Tests with ZERO Spills (Higher is Better)')
+    axs[0, 1].set_title('Tests with ZERO Spills ')
     for bar in bars2:
         axs[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
                        f'{int(bar.get_height()):,}', ha='center', va='bottom', fontweight='bold')
@@ -101,10 +101,10 @@ def main():
     # 3. CDF of Spill Counts (Log Scale)
     plot_cdf(axs[1, 0], b_spills, 'Basic', c_basic)
     plot_cdf(axs[1, 0], g_spills, 'Greedy', c_greedy)
-    plot_cdf(axs[1, 0], s_spills, 'SSA (Theoretical)', c_ssa, linestyle='--')
+    plot_cdf(axs[1, 0], s_spills, 'SSA ', c_ssa, linestyle='--')
     
     axs[1, 0].set_title('Spill Count CDF (Log Scale)')
-    axs[1, 0].set_xlabel('Number of Spills (Left is Better)')
+    axs[1, 0].set_xlabel('Number of Spills ')
     axs[1, 0].set_ylabel('Fraction of Tests')
     axs[1, 0].set_xscale('symlog') 
     axs[1, 0].grid(True, alpha=0.3)
@@ -112,12 +112,12 @@ def main():
 
     # 4. CDF of Register Usage / Pressure
     # Note: For SSA, 'regs' represents Max Pressure, for others it is actual PhysRegs used.
-    plot_cdf(axs[1, 1], b_regs, 'Basic (Used)', c_basic)
-    plot_cdf(axs[1, 1], g_regs, 'Greedy (Used)', c_greedy)
-    plot_cdf(axs[1, 1], s_regs, 'SSA (Max Pressure)', c_ssa, linestyle='--')
+    plot_cdf(axs[1, 1], b_regs, 'Basic', c_basic)
+    plot_cdf(axs[1, 1], g_regs, 'Greedy', c_greedy)
+    plot_cdf(axs[1, 1], s_regs, 'SSA', c_ssa, linestyle='--')
     
     axs[1, 1].set_title('Register Usage / Pressure CDF')
-    axs[1, 1].set_xlabel('Registers (Left is Better)')
+    axs[1, 1].set_xlabel('Registers')
     axs[1, 1].set_ylabel('Fraction of Tests')
     axs[1, 1].grid(True, alpha=0.3)
     axs[1, 1].legend()
