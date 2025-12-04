@@ -15,8 +15,15 @@ TARGET_COUNT = 500  # Stop after this many successful tests
 # Regex for RISC-V registers (ABI names and Architectural names)
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
+def log_skip(filename, reason):
+    """Helper to print skip reasons clearly."""
+    # Clear the current progress line before printing the skip message
+    sys.stdout.write(f"\r{(' ' * 80)}\r") 
+    print(f"[SKIP] {filename}: {reason}")
+
 def parse_requirements(file_path):
     """Check if the file is suitable for RISC-V execution."""
+    filename = os.path.basename(file_path)
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
     
@@ -27,6 +34,7 @@ def parse_requirements(file_path):
         forbidden = ['x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon', 'nvptx', 'amdgpu', 'systemz', 'wasm']
         for arch in forbidden:
             if arch in reqs:
+                log_skip(filename, f"REQUIRES forbidden arch '{arch}'")
                 return False, None
     
     # 2. Extract RUN command and check -mtriple
@@ -40,22 +48,26 @@ def parse_requirements(file_path):
                 arch = triple_match.group(1).lower()
                 # If explicit triple exists, it MUST contain 'riscv'
                 if 'riscv' not in arch:
+                    # Don't log skip yet, just look for another RUN line
                     continue 
             
             llc_run = line
             break
             
     if not llc_run:
+        log_skip(filename, "No valid RISC-V 'llc' RUN line found")
         return False, None
             
     return True, llc_run
 
 def extract_clean_command(run_line, file_path):
     """Clean the RUN line to get a standalone llc command for RISC-V."""
+    filename = os.path.basename(file_path)
     # 1. Stop at pipes (|) or redirects (>)
     # Note: We explicitly do NOT stop at < because we want to capture < %s to clean it up
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
+        log_skip(filename, "Could not parse llc command from RUN line")
         return None
     cmd_str = match.group(1)
     
@@ -88,6 +100,7 @@ def count_unique_registers(asm_file):
 
 def run_benchmark(file_path, run_cmd, alloc_mode):
     """Run llc with specific allocator and gather stats."""
+    filename = os.path.basename(file_path)
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
     else:
@@ -104,9 +117,12 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
             timeout=5 
         )
     except subprocess.TimeoutExpired:
+        log_skip(filename, f"Timeout during {alloc_mode} allocation")
         return None, 0
 
     if result.returncode != 0:
+        stderr_msg = result.stderr.decode('utf-8', errors='ignore').split('\n')[0]
+        log_skip(filename, f"Crash/Error during {alloc_mode}: {stderr_msg[:50]}...")
         return None, 0
 
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
@@ -173,6 +189,7 @@ def main():
                 continue 
             
             if b_reg == 0 and g_reg == 0:
+                log_skip(os.path.basename(fpath), "Trivial test (0 registers used)")
                 skipped_count += 1
                 continue
                 
