@@ -15,7 +15,12 @@
 // It assumes the input is in SSA form.
 //
 //===----------------------------------------------------------------------===//
-
+#include "llvm/CodeGen/LiveDebugVariables.h"
+#include "llvm/CodeGen/LiveInterval.h"
+#include "llvm/CodeGen/LiveIntervalUnion.h"
+#include "llvm/CodeGen/LiveRangeEdit.h"
+#include "llvm/CodeGen/LiveRegMatrix.h"
+#include "llvm/CodeGen/LiveStacks.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -29,6 +34,7 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include "llvm/InitializePasses.h"
 
 using namespace llvm;
 
