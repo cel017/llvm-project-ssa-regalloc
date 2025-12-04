@@ -13,7 +13,6 @@ OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  # Stop after this many successful tests
 
 # Regex for RISC-V registers (ABI names and Architectural names)
-# FIXED: Correctly matches x0-x31, f0-f31 by grouping the numbers with the prefix.
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
 def parse_requirements(file_path):
@@ -35,14 +34,13 @@ def parse_requirements(file_path):
     llc_run = None
     for line in run_lines:
         if 'llc' in line:
-            # Check if this specific RUN line targets a non-RISCV architecture
-            # Matches -mtriple=x86_64, -mtriple=arm, etc.
+            # Check for explicitly forbidden architectures in -mtriple
             triple_match = re.search(r'-mtriple=([a-zA-Z0-9_]+)', line)
             if triple_match:
                 arch = triple_match.group(1).lower()
-                # If triple is present but NOT riscv, skip it
+                # If explicit triple exists, it MUST contain 'riscv'
                 if 'riscv' not in arch:
-                    continue # Skip this RUN line, look for another
+                    continue 
             
             llc_run = line
             break
@@ -54,16 +52,24 @@ def parse_requirements(file_path):
 
 def extract_clean_command(run_line, file_path):
     """Clean the RUN line to get a standalone llc command for RISC-V."""
+    # 1. Stop at pipes (|) or redirects (>)
+    # Note: We explicitly do NOT stop at < because we want to capture < %s to clean it up
     match = re.search(r'(llc.*?)(?:\s*[|>].*)?$', run_line)
     if not match:
         return None
     cmd_str = match.group(1)
     
-    # --- CHANGED: Native Mode ---
-    # Since the host is RISC-V, we trust the file's original command entirely.
-    # We do NOT strip -mtriple or inject anything.
+    # 2. CRITICAL FIX: Remove trailing backslashes that cause shell to hang
+    cmd_str = cmd_str.replace('\\', ' ')
     
-    cmd_str = cmd_str.replace('%s', f'"{file_path}"')
+    # 3. Handle input file replacement
+    # Some tests use "< %s". llc accepts "llc file.ll". 
+    # We replace "< %s" with just the filename, effectively converting redirect to arg.
+    if '< %s' in cmd_str:
+        cmd_str = cmd_str.replace('< %s', f'"{file_path}"')
+    else:
+        cmd_str = cmd_str.replace('%s', f'"{file_path}"')
+        
     return cmd_str.strip()
 
 def count_unique_registers(asm_file):
@@ -113,10 +119,8 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
-    # --- CHANGED: Case-Insensitive Sort ---
     files.sort(key=lambda x: os.path.basename(x).lower())
     
-    # Rotate list to start at 'r'
     start_index = 0
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath).lower()
@@ -134,7 +138,6 @@ def main():
     valid_count = 0
     skipped_count = 0
     
-    # Open CSV for writing
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -144,7 +147,6 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            # Show skipped count to confirm script is working
             sys.stdout.write(f"\r[Collected: {valid_count}/{TARGET_COUNT} | Skipped: {skipped_count}] Scanning {i+1}/{total_files} ({os.path.basename(fpath)})...")
             sys.stdout.flush()
             
@@ -170,12 +172,10 @@ def main():
                 skipped_count += 1
                 continue 
             
-            # Filter trivial files
             if b_reg == 0 and g_reg == 0:
                 skipped_count += 1
                 continue
                 
-            # Write row immediately
             writer.writerow({
                 'filename': os.path.basename(fpath),
                 'basic_spills': b_spill,
@@ -183,7 +183,7 @@ def main():
                 'greedy_spills': g_spill,
                 'greedy_regs': g_reg
             })
-            csvfile.flush() # Ensure data is saved if script crashes
+            csvfile.flush() 
             valid_count += 1
             
     print(f"\n\nDone! Saved {valid_count} records to {OUTPUT_CSV}")
