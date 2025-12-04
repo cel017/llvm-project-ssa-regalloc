@@ -18,10 +18,7 @@ TARGET_COUNT = 500  # Stop after this many successful tests
 REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
 
 def log_skip(filename, reason):
-    """Helper to print skip reasons clearly."""
-    # Clear the current progress line before printing the skip message
-    sys.stdout.write(f"\r{(' ' * 80)}\r") 
-    print(f"[SKIP] {filename}: {reason}")
+    pass
 
 def parse_requirements(file_path):
     """Check if the file is suitable for RISC-V execution."""
