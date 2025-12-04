@@ -105,8 +105,9 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     
-    # Sort A-Z
-    files.sort()
+    # --- CHANGED: Case-Insensitive Sort ---
+    # This prevents Uppercase files (ASCII < 97) from splitting the list
+    files.sort(key=lambda x: os.path.basename(x).lower())
     
     # Rotate list to start at 'r'
     start_index = 0
@@ -116,11 +117,12 @@ def main():
             start_index = i
             break
             
-    # Rotate list: [r..., z, a..., q]
     files = files[start_index:] + files[:start_index]
 
     total_files = len(files)
+    start_file_name = os.path.basename(files[0]) if files else "None"
     print(f"Found {total_files} .ll files. Processing for Native RISC-V.")
+    print(f"Starting at file: {start_file_name}")
     
     valid_count = 0
     
