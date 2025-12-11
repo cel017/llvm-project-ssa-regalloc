@@ -11,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/CodeGen/RegAllocBase.h" // Essential base class
+#include "RegAllocBase.h" // Essential base class
 #include "llvm/AllocationOrder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
