@@ -4,7 +4,7 @@ import sys
 import os
 
 INPUT_CSV = "benchmark_results.csv"
-OUTPUT_IMG = "riscv_regalloc_dashboard_nerfed.png"
+OUTPUT_IMG = "riscv_regalloc_trivial.png"
 
 def plot_cdf(ax, data, label, color, linestyle='-'):
     """Helper to plot a Cumulative Distribution Function."""
@@ -29,7 +29,7 @@ def main():
         print("CSV is empty.")
         sys.exit(1)
 
-    # --- FILTERING STEP ---
+    # Filtering step
     data = []
     skipped_count = 0
     
@@ -48,28 +48,18 @@ def main():
         print(f"No valid data found after filtering! (Skipped {skipped_count} rows where ssa_regs=0)")
         sys.exit(1)
 
-    # Extract columns from filtered data
+    # Extract columns from filtered data, using values exactly as in the CSV
     b_spills = [int(d['basic_spills']) for d in data]
     g_spills = [int(d['greedy_spills']) for d in data]
+    s_spills = [int(d.get('ssa_spills', 0)) for d in data]
     
     b_regs = [int(d['basic_regs']) for d in data]
     g_regs = [int(d['greedy_regs']) for d in data]
-
-    # --- THE "NERF" BLOCK ---
-    
-    # 1. Regs: "Sweet Spot" approach.
-    #    - Low pressure (<= 5): Match Greedy.
-    #    - High pressure (>= 12): Match Greedy (Converge at saturation/hardware limit).
-    #    - Middle (6-11): SSA performs slightly better (r - 1).
-    s_regs = [r if (r <= 5 or r >= 12) else (r - 1) for r in g_regs]
-    
-    # 2. Spills: Keep the previous logic to target ~202 spills.
-    s_spills = [int(int(d.get('ssa_spills', 0)) * 2.55) for d in data]
-    # ------------------------
+    s_regs = [int(d.get('ssa_regs', 0)) for d in data]
 
     count = len(data)
     print(f"Plotting data for {count} tests (Filtered out {skipped_count} zeros)...")
-    print("Applying SSA 'Realism' Adjustment (Regs: Match Ends, Middle -1; Spills x2.55)...")
+    print("Using SSA data directly from CSV (no adjustments).")
 
     # Set up 2x2 grid
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
@@ -85,7 +75,7 @@ def main():
     total_g = sum(g_spills)
     total_s = sum(s_spills)
     
-    labels = ['Basic', 'Greedy', 'SSA (Adj)']
+    labels = ['Basic', 'Greedy', 'SSA']
     values = [total_b, total_g, total_s]
     colors = [c_basic, c_greedy, c_ssa]
 
@@ -93,8 +83,14 @@ def main():
     axs[0, 0].set_title('Total Spills (Lower is Better)')
     axs[0, 0].set_ylabel('Count')
     for bar in bars:
-        axs[0, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
-                       f'{int(bar.get_height()):,}', ha='center', va='bottom', fontweight='bold')
+        axs[0, 0].text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f'{int(bar.get_height()):,}',
+            ha='center',
+            va='bottom',
+            fontweight='bold'
+        )
 
     # 2. Perfect Allocation Rate (Zero Spills)
     zeros_b = b_spills.count(0)
@@ -106,13 +102,19 @@ def main():
     bars2 = axs[0, 1].bar(labels, z_values, color=colors)
     axs[0, 1].set_title('Tests with ZERO Spills')
     for bar in bars2:
-        axs[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height(), 
-                       f'{int(bar.get_height()):,}', ha='center', va='bottom', fontweight='bold')
+        axs[0, 1].text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f'{int(bar.get_height()):,}',
+            ha='center',
+            va='bottom',
+            fontweight='bold'
+        )
 
     # 3. CDF of Spill Counts (Log Scale)
     plot_cdf(axs[1, 0], b_spills, 'Basic', c_basic)
     plot_cdf(axs[1, 0], g_spills, 'Greedy', c_greedy)
-    plot_cdf(axs[1, 0], s_spills, 'SSA (Adj)', c_ssa, linestyle='--')
+    plot_cdf(axs[1, 0], s_spills, 'SSA', c_ssa, linestyle='--')
     
     axs[1, 0].set_title('Spill Count CDF (Log Scale)')
     axs[1, 0].set_xlabel('Number of Spills')
@@ -130,7 +132,6 @@ def main():
     axs[1, 1].set_xlabel('Registers')
     axs[1, 1].set_ylabel('Fraction of Tests')
     axs[1, 1].grid(True, alpha=0.3)
-    axs[1, 1].legend()
     # Force X-axis limit to 16 (RV32E limit)
     axs[1, 1].set_xlim(0, 16)
 

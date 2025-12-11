@@ -12,13 +12,16 @@ TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
-# --- NEW CONFIG: Increase Pressure ---
+# New config: increase pressure
 # "-mattr=+e" enables the RISC-V Embedded extension.
 # This reduces the available GPRs from 32 down to 16, forcing high pressure.
 LLC_MATTR = "-mattr=+e" 
 
 # Regex for RISC-V registers
-REG_PATTERN = re.compile(r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|s[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b')
+REG_PATTERN = re.compile(
+    r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|'
+    r's[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b'
+)
 
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
@@ -27,7 +30,10 @@ def parse_requirements(file_path):
     requires_line = re.search(r';\s*REQUIRES:\s*(.*)', content)
     if requires_line:
         reqs = requires_line.group(1).lower()
-        forbidden = ['x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon', 'nvptx', 'amdgpu', 'systemz', 'wasm']
+        forbidden = [
+            'x86', 'aarch64', 'arm', 'mips', 'powerpc', 'hexagon',
+            'nvptx', 'amdgpu', 'systemz', 'wasm'
+        ]
         for arch in forbidden:
             if arch in reqs:
                 return False, None
@@ -68,91 +74,59 @@ def count_unique_registers(asm_file):
     unique_regs = set()
     with open(asm_file, 'r', errors='ignore') as f:
         for line in f:
-            if line.strip().startswith('.') or line.strip().startswith('#'):
+            stripped = line.strip()
+            if stripped.startswith('.') or stripped.startswith('#'):
                 continue
             matches = REG_PATTERN.findall(line)
             for m in matches:
                 unique_regs.add(m)
     return len(unique_regs)
 
-def parse_ssa_report(stderr_output, file_name):
-    """
-    Parses lines like:
-    @SSA_REPORT func=main class=GPR spills=2 pressure=15
-    """
-    total_spills = 0
-    max_pressure = 0
-    found_report = False
-    
-    # Regex: @SSA_REPORT .* spills=(\d+) pressure=(\d+)
-    report_pattern = re.compile(r'@SSA_REPORT.*spills=(\d+)\s+pressure=(\d+)')
-
-    for line in stderr_output.splitlines():
-        match = report_pattern.search(line)
-        if match:
-            found_report = True
-            spills = int(match.group(1))
-            pressure = int(match.group(2))
-            
-            total_spills += spills
-            if pressure > max_pressure:
-                max_pressure = pressure
-
-    # Debugging: If we found no report, print stderr to see what happened
-    if not found_report:
-        # Optional: Uncomment if you want to see errors for failed files
-        # print(f"\n[WARNING] No SSA report found for {file_name}")
-        pass
-
-    return total_spills, max_pressure
-
 def run_benchmark(file_path, run_cmd, alloc_mode):
-    # Prepare command with Allocator
+    # Prepare command with allocator
     if "-regalloc=" in run_cmd:
         cmd = re.sub(r'-regalloc=\S+', f'-regalloc={alloc_mode}', run_cmd)
     else:
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
     
-    # --- CHANGE: Inject the MATTR flag to increase pressure ---
+    # Inject the MATTR flag to increase pressure
     cmd = f"{cmd} {LLC_MATTR} -stats -o {TEMP_ASM}"
     
     try:
-        # Run process
         result = subprocess.run(
-            cmd, 
-            shell=True, 
-            stderr=subprocess.PIPE, 
+            cmd,
+            shell=True,
+            stderr=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            timeout=5 
+            timeout=5
         )
     except subprocess.TimeoutExpired:
         return None, 0
 
     stderr_output = result.stderr.decode('utf-8', errors='ignore')
 
-    if alloc_mode == "ssa":
-        spills, regs = parse_ssa_report(stderr_output, os.path.basename(file_path))
-        return spills, regs
-    else:
-        if result.returncode != 0:
-            return None, 0
-            
-        spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
-        spills = int(spill_match.group(1)) if spill_match else 0
-        
-        regs = count_unique_registers(TEMP_ASM)
-        return spills, regs
+    if result.returncode != 0:
+        return None, 0
+
+    # Parse generic spill stats
+    spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
+    spills = int(spill_match.group(1)) if spill_match else 0
+
+    # Count unique registers from the generated asm
+    regs = count_unique_registers(TEMP_ASM)
+    return spills, regs
 
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
     files.sort(key=lambda x: os.path.basename(x).lower())
     
+    # Rotate so that we start at the first file whose name is >= 'r'
     start_index = 0
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath).lower()
         if fname >= 'r':
             start_index = i
-            break     
+            break
     files = files[start_index:] + files[:start_index]
 
     print(f"Processing {len(files)} files with high pressure ({LLC_MATTR})...")
@@ -161,7 +135,12 @@ def main():
     skipped_count = 0
     
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
-        fieldnames = ['filename', 'basic_spills', 'basic_regs', 'greedy_spills', 'greedy_regs', 'ssa_spills', 'ssa_regs']
+        fieldnames = [
+            'filename',
+            'basic_spills', 'basic_regs',
+            'greedy_spills', 'greedy_regs',
+            'ssa_spills', 'ssa_regs'
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         
@@ -169,7 +148,10 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            sys.stdout.write(f"\r[Collected: {valid_count} | Skipped: {skipped_count}] {os.path.basename(fpath)}...    ")
+            sys.stdout.write(
+                f"\r[Collected: {valid_count} | Skipped: {skipped_count}] "
+                f"{os.path.basename(fpath)}...    "
+            )
             sys.stdout.flush()
             
             valid, run_line = parse_requirements(fpath)
@@ -184,17 +166,17 @@ def main():
                 
             # 1. Basic
             b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
-            if b_reg is None: 
+            if b_reg is None:
                 skipped_count += 1
                 continue 
             
             # 2. Greedy
             g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
-            if g_reg is None: 
+            if g_reg is None:
                 skipped_count += 1
                 continue 
             
-            # 3. SSA (New format)
+            # 3. SSA computed exactly like basic and greedy
             ssa_spill, ssa_regs = run_benchmark(fpath, clean_cmd, "ssa")
             
             # Filter trivial files
