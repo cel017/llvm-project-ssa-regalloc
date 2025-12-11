@@ -12,7 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RegAllocBase.h" // Essential base class
-#include "llvm/AllocationOrder.h"
+#include "AllocationOrder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
