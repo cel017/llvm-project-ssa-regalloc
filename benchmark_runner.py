@@ -1,73 +1,68 @@
 import os
 import subprocess
 import csv
-import time
+import re
 
 # --- CONFIGURATION ---
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_rv32e.csv"
+RESULTS_FILE = "results_spill_counts.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
-# We focus on the benchmarks that showed sensitivity earlier
 BENCHMARKS = [
-    # Control Flow Heavy (Expect Greedy/SSA to win)
+    "linear-algebra/blas/gemm/gemm.c",
     "linear-algebra/blas/syrk/syrk.c",
-    "linear-algebra/blas/trmm/trmm.c",
-    
-    # Solvers (Complex Liveness)
     "linear-algebra/solvers/lu/lu.c",
-    "linear-algebra/solvers/cholesky/cholesky.c",
-    
-    # Stencils (Many live neighbors)
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
-
-    # Dense (Baseline)
-    "linear-algebra/blas/gemm/gemm.c",
 ]
 
-# --- RV32E SIMULATION FLAGS ---
-# RV32E only has registers x0 through x15.
-# We reserve x16 through x31 to force the compiler to work with half the register file.
+# --- 1. RV32E SIMULATION (16 Registers) ---
 reserved_regs = []
-for r in range(16, 32): 
-    reserved_regs.append(f"+reserve-x{r}")
-
-# Combine into -mattr flag
+for r in range(16, 32): reserved_regs.append(f"+reserve-x{r}")
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
+
+# --- 2. DATASET ---
+# Medium size + standard types
+SIZE_FLAGS = "-DSTANDARD_DATASET -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256 -Wno-macro-redefined"
+
+def count_spills(asm_file):
+    """
+    Counts store instructions that target the stack pointer (sp).
+    RISC-V pattern: 'sd  reg, offset(sp)' or 'fsd reg, offset(sp)'
+    """
+    try:
+        with open(asm_file, 'r') as f:
+            content = f.read()
+            # Regex to find stores to the stack:
+            # (sd|fsd|sw|fsw) -> Store Double/Float/Word
+            # \s+ -> whitespace
+            # .*, -> register operand
+            # .*\d*\(sp\) -> offset(sp)
+            spills = re.findall(r'(sd|fsd|sw|fsw)\s+.*,.*\d*\(sp\)', content)
+            return len(spills)
+    except:
+        return 0
 
 def run_command(cmd):
     try:
-        # stdout is hidden, but we let stderr show up if something crashes
-        subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL)
+        # UPDATED: stderr=subprocess.DEVNULL silences the warnings.
+        # check_call will still raise an error if the command crashes (non-zero exit code).
+        subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        print(f"\n!! Command Failed: {cmd}")
         return False
     return True
 
-def get_exec_time(exe_path):
-    try:
-        times = []
-        # Standard Dataset is slower, so 3 runs is enough
-        for _ in range(3): 
-            result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
-            val = result.stdout.strip()
-            if val: times.append(float(val))
-        if not times: return None
-        return sum(times) / len(times)
-    except Exception:
-        return None
-
 def main():
-    print(f"Starting RV32E Suite (16 Regs) using LLC: {LLC_PATH}")
-    print(f"--- MODE: STANDARD DATASET + x16-x31 RESERVED ---")
+    print(f"Starting SPILL COUNT Analysis (RV32E + Unroll)")
+    print(f"Metric: Number of Store instructions to Stack (Lower is Better)")
+    print(f"Warnings are silenced.")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Benchmark"] + ALLOCATORS)
+        writer.writerow(["Benchmark", "Alloc", "SpillCount"])
 
     for bench_path in BENCHMARKS:
         bench_name = os.path.basename(bench_path).replace(".c", "")
@@ -75,16 +70,15 @@ def main():
         bench_dir = os.path.dirname(full_src_path)
         
         print(f"--- Processing: {bench_name} ---")
-        row_data = [bench_name]
 
-        # 1. EMIT IR (System Clang)
-        # Standard Dataset + O1 (Keep loops intact)
+        # 1. EMIT IR (With Unrolling to force pressure)
         ir_file = f"{bench_name}.ll"
         cmd_ir = (
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
+            f"-funroll-loops -mllvm -unroll-count=4 " # Force pressure up
             f"-I {POLYBENCH_ROOT}/utilities "
             f"-I {bench_dir} "
-            f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS -DSTANDARD_DATASET"
+            f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS {SIZE_FLAGS}"
         )
         
         if not run_command(cmd_ir):
@@ -92,49 +86,30 @@ def main():
             continue
 
         for alloc in ALLOCATORS:
-            obj_file = f"{bench_name}_{alloc}.o"
-            exe_file = f"./{bench_name}_{alloc}"
+            asm_file = f"{bench_name}_{alloc}.s" # Generate Assembly text
             
-            # 2. COMPILE (Custom LLC)
-            # Injecting RV32E Flags
+            # 2. COMPILE TO ASM (Not Object) so we can count spills
             cmd_llc = (
-                f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=obj "
+                f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=asm "
                 f"{STARVE_FLAGS} "
-                f"{ir_file} -o {obj_file}"
+                f"{ir_file} -o {asm_file}"
             )
             
             if not run_command(cmd_llc):
-                row_data.append("Fail")
+                print(f"  {alloc}: Failed (Crash)")
                 continue
 
-            # 3. LINK
-            poly_util = os.path.join(POLYBENCH_ROOT, "utilities/polybench.c")
-            cmd_link = f"{CLANG_PATH} {obj_file} {poly_util} -DPOLYBENCH_TIME -o {exe_file} -lm"
+            # 3. COUNT SPILLS
+            spill_count = count_spills(asm_file)
+            print(f"  {alloc}: {spill_count} stores to stack")
             
-            if not run_command(cmd_link):
-                row_data.append("Fail")
-                continue
+            # Save
+            with open(RESULTS_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([bench_name, alloc, spill_count])
+            
+            if os.path.exists(asm_file): os.remove(asm_file)
 
-            # 4. RUN
-            print(f"   Testing {alloc}...", end="", flush=True)
-            avg_time = get_exec_time(exe_file)
-            
-            if avg_time is not None:
-                print(f" {avg_time:.4f}s")
-                row_data.append(f"{avg_time:.6f}")
-            else:
-                print(" Error")
-                row_data.append("RunFail")
-            
-            # Cleanup
-            if os.path.exists(exe_file): os.remove(exe_file)
-            if os.path.exists(obj_file): os.remove(obj_file)
-
-        # Save immediately
-        with open(RESULTS_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(row_data)
-        
         if os.path.exists(ir_file): os.remove(ir_file)
 
     print(f"\nDone! Results saved to {RESULTS_FILE}")
