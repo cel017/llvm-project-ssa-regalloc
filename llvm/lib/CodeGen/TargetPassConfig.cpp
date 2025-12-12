@@ -1457,8 +1457,9 @@ void TargetPassConfig::addFastRegAlloc() {
 }
 
 namespace llvm {
-  extern FunctionPass *createBasicRegisterAllocator(RegAllocFilterFunc);
+  extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
   extern FunctionPass *createCriticalEdgeRemovalPass();
+  extern FunctionPass *createSSADeconstructionPass();
 }
 
 /// Add standard target-independent passes that are tightly coupled with
@@ -1488,14 +1489,9 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&MachineLoopInfoID);
   
   //------497--------//
-  if (RegAlloc == (FunctionPass *(*)())&createBasicRegisterAllocator) {
-    // pre-SSA regalloc passes
+  if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
+    // Pre-SSA regalloc passes
     addPass(createCriticalEdgeRemovalPass());
-
-    addPass(&PHIEliminationID);
-    if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
-    addPass(&TwoAddressInstructionPassID);
-    addPass(&RegisterCoalescerID);
   } else {
     // Standard pipeline
     addPass(&PHIEliminationID);
@@ -1513,6 +1509,12 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&MachineSchedulerID);
 
   if (addRegAssignAndRewriteOptimized()) {
+
+    //------497--------//
+    if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
+      addPass(createSSADeconstructionPass());
+    }
+
     // Perform stack slot coloring and post-ra machine LICM.
     addPass(&StackSlotColoringID);
 

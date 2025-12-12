@@ -224,6 +224,7 @@ add_llvm_component_library(LLVMCodeGen
   SlotIndexes.cpp
   SpillPlacement.cpp
   SplitKit.cpp
+  SSADeconstruction_497.cpp
   StackColoring.cpp
   StackFrameLayoutAnalysisPass.cpp
   StackMapLivenessAnalysis.cpp
