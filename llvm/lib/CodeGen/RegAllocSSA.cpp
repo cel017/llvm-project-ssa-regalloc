@@ -1,7 +1,17 @@
 //===-- RegAllocSSA.cpp - SSA Register Allocator --------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file defines the RASSA function pass, which provides a minimal
+// implementation of the basic register allocator (adapted for SSA context).
+//
 //===----------------------------------------------------------------------===//
 
-#include "RegAllocBase.h"
+#include "RegAllocBase.h" // Essential base class
 #include "AllocationOrder.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
@@ -32,52 +42,6 @@
 #include "llvm/CodeGen/MachineBasicBlock.h"
 
 using namespace llvm;
-
-/// helper class to calculate static spill weights based on Loop Depth.
-class SpillWeightCalculator {
-  const MachineRegisterInfo &MRI;
-  const MachineLoopInfo &MLI;
-
-  // lookup table; cap depth to not overflow 
-  static constexpr unsigned Pow10[] = { 
-    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000 
-  };
-
-  unsigned getLoopWeight(const MachineBasicBlock *MBB) const {
-    unsigned Depth = MLI.getLoopDepth(MBB);
-    if (Depth >= std::size(Pow10)) Depth = std::size(Pow10) - 1;
-    return Pow10[Depth];
-  }
-
-public:
-  SpillWeightCalculator(const MachineRegisterInfo &mri, const MachineLoopInfo &mli) 
-    : MRI(mri), MLI(mli) {}
-
-  // algorithm from the original paper
-  unsigned getWeight(Register Reg) const {
-    if (!Reg.isVirtual()) return 0;
-
-    unsigned W = 0;
-
-    // MRI provides O(1) lookup for the definition instruction.
-    MachineInstr *DefMI = MRI.getVRegDef(Reg);
-    if (DefMI) {
-      W += 1 + getLoopWeight(DefMI->getParent());
-    }
-
-    for (MachineInstr &UseMI : MRI.reg_nodbg_instructions(Reg)) {
-      if (&UseMI == DefMI) continue;          
-      W += 1 + getLoopWeight(UseMI.getParent());
-    }
-
-    return W;
-  }
-  
-  MachineInstr* getDefSite(Register Reg) const {
-      return MRI.getVRegDef(Reg);
-  }
-
-};
 
 #define DEBUG_TYPE "regalloc"
 
