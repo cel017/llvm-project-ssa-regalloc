@@ -7,31 +7,50 @@ import re
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_spill_counts_standard.csv"
+RESULTS_FILE = "results_spill_counts_starved.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
 BENCHMARKS = [
-    "linear-algebra/blas/gemm/gemm.c",
+    # Control Flow Heavy (Expect Greedy to win on spills)
     "linear-algebra/blas/syrk/syrk.c",
+    "linear-algebra/blas/trmm/trmm.c",
+    
+    # Solvers (Complex Liveness)
     "linear-algebra/solvers/lu/lu.c",
+    
+    # Stencils
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
+
+    # Dense Baseline
+    "linear-algebra/blas/gemm/gemm.c",
 ]
 
-# --- 1. NO STARVATION (Standard Arch) ---
-# We removed the -mattr=+reserve flags. 
-# The allocator has full access to all ~32 registers.
-STARVE_FLAGS = "" 
+# --- 1. NUCLEAR STARVATION (5 Regs: a0-a4) ---
+reserved_regs = []
+# Reserve Temps t0-t2 (x5-x7)
+for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
+# Reserve Saved s0-s1 (x8-x9)
+for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
+# Reserve High Args a5-a7 (x15-x17)
+for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
+# Reserve High Saved/Temps (x18-x31)
+for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
 
-# --- 2. DATASET ---
-SIZE_FLAGS = "-DSTANDARD_DATASET -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256 -Wno-macro-redefined"
+STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
+
+# --- 2. DATASET (Medium Size) ---
+# -DSTANDARD_DATASET: Sets correct data types (double/float)
+# -Wno-macro-redefined: Allows us to overwrite the size macros without error
+# -DNI=256...: Sets size to 256 (Fast runtime, identical pressure pattern)
+SIZE_FLAGS = "-DSTANDARD_DATASET -Wno-macro-redefined -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256"
 
 def count_spills(asm_file):
     try:
         with open(asm_file, 'r') as f:
             content = f.read()
-            # Regex for RISC-V Stack Stores
+            # RISC-V Stack Stores: sd/fsd/sw/fsw ... offset(sp)
             spills = re.findall(r'(sd|fsd|sw|fsw)\s+.*,.*\d*\(sp\)', content)
             return len(spills)
     except:
@@ -39,13 +58,14 @@ def count_spills(asm_file):
 
 def run_command(cmd):
     try:
+        # Silencing warnings
         subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         return False
     return True
 
 def main():
-    print(f"Starting SPILL COUNT Analysis (Standard Arch + Unroll=8)")
+    print(f"Starting SPILL COUNT Analysis (Starved 5 Regs)")
     print(f"Metric: Number of Store instructions to Stack (Lower is Better)")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
@@ -60,12 +80,9 @@ def main():
         print(f"--- Processing: {bench_name} ---")
 
         # 1. EMIT IR 
-        # UPDATED: unroll-count=8. 
-        # With 32 registers available, we need massive loops to force spilling.
         ir_file = f"{bench_name}.ll"
         cmd_ir = (
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
-            f"-funroll-loops -mllvm -unroll-count=8 " 
             f"-I {POLYBENCH_ROOT}/utilities "
             f"-I {bench_dir} "
             f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS {SIZE_FLAGS}"
@@ -86,7 +103,11 @@ def main():
             )
             
             if not run_command(cmd_llc):
-                print(f"  {alloc}: Failed")
+                # Basic is likely to crash here due to running out of registers
+                print(f"  {alloc}: Failed (Ran out of registers?)")
+                with open(RESULTS_FILE, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([bench_name, alloc, "Failed"])
                 continue
 
             # 3. COUNT SPILLS
