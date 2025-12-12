@@ -1,32 +1,82 @@
 import os
 import subprocess
 import csv
+import re
 import time
 
 # --- CONFIGURATION ---
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_runtime_baseline.csv"
+RESULTS_FILE = "results_spec_metrics.csv"
 
-ALLOCATORS = ["basic", "greedy", "ssa"]
+ALLOCATORS = ["basic", "greedy"]
 
+# The "SPEC Equivalent" Suite
 BENCHMARKS = [
-    "linear-algebra/blas/trmm/trmm.c",
-    "linear-algebra/blas/syrk/syrk.c",
-    "linear-algebra/solvers/lu/lu.c",
+    "linear-algebra/kernels/2mm/2mm.c",
+    "stencils/fdtd-2d/fdtd-2d.c",
     "medley/floyd-warshall/floyd-warshall.c",
+    "stencils/jacobi-2d/jacobi-2d.c",
+    "linear-algebra/solvers/ludcmp/ludcmp.c",
     "medley/deriche/deriche.c",
-    "linear-algebra/blas/gemm/gemm.c",
-]
+    "linear-algebra/blas/syrk/syrk.c"
+    ]
 
-# --- 1. NO STARVATION (Standard Arch) ---
-# We remove all reserve flags. The allocator has full access to ~32 registers.
-STARVE_FLAGS = ""
+# --- STARVATION (5 Registers: a0-a4) ---
 
-# --- 2. DATASET (Standard + Heap) ---
-# Default behavior. Data on Heap. Large size.
+reserved_regs = []
+for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")   # t0-t2
+for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")  # s0-s1
+for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}") # a5-a7
+for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}") # s2-s11, t3-t6
+STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
+
+# --- DATASET ---
+# Standard Dataset for correctness, Heap arrays for stability
 SIZE_FLAGS = "-DSTANDARD_DATASET"
+
+def get_static_metrics(asm_file):
+    """
+    Parses RISC-V assembly to count specific instruction categories.
+    """
+    metrics = {'store': 0, 'load': 0, 'move': 0, 'xor': 0}
+    
+    try:
+        with open(asm_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip labels and comments
+                if line.endswith(':') or line.startswith('.') or line.startswith('#'):
+                    continue
+                
+                # Tokenize the opcode (first word)
+                parts = line.split()
+                if not parts: continue
+                opcode = parts[0]
+
+                # 1. STORES (Stack spills + Data saves)
+                if re.match(r'^(sd|fsd|sw|fsw|sh|sb)$', opcode):
+                    metrics['store'] += 1
+                
+                # 2. LOADS (Stack reloads + Data fetches)
+                elif re.match(r'^(ld|fld|lw|flw|lh|lb)$', opcode):
+                    metrics['load'] += 1
+                
+                # 3. MOVES (Register Shuffling)
+                # LLVM RISC-V emits 'mv' or 'fmv'. 
+                # Sometimes 'addi rd, rs, 0' is used, but 'mv' is standard alias.
+                elif re.match(r'^(mv|fmv\.d|fmv\.w|fmv\.x\.w|fmv\.w\.x)$', opcode):
+                    metrics['move'] += 1
+                    
+                # 4. XOR (Logic/Checksums)
+                elif re.match(r'^(xor|xori)$', opcode):
+                    metrics['xor'] += 1
+                    
+    except Exception as e:
+        print(f"Error parsing ASM: {e}")
+    
+    return metrics
 
 def run_command(cmd):
     try:
@@ -38,7 +88,7 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
-        # Run 3 times (Standard dataset is slow, ~10-20s per run)
+        # Run 3 times
         for _ in range(3): 
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
@@ -49,11 +99,12 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting RUNTIME Analysis (Baseline: Full Regs + Standard Dataset)")
+    print(f"Starting SPEC-Like Metric Collection (5 Regs)")
     
+    # Write CSV Header
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Benchmark", "Alloc", "Time(s)"])
+        writer.writerow(["Benchmark", "Allocator", "Store", "Load", "Move", "Xor", "Time(s)"])
 
     for bench_path in BENCHMARKS:
         bench_name = os.path.basename(bench_path).replace(".c", "")
@@ -76,55 +127,66 @@ def main():
             continue
 
         for alloc in ALLOCATORS:
+            asm_file = f"{bench_name}_{alloc}.s"
             obj_file = f"{bench_name}_{alloc}.o"
             exe_file = f"./{bench_name}_{alloc}"
             
-            # 2. COMPILE (Custom LLC)
-            cmd_llc = (
+            # 2. COMPILE TO ASM (To count instructions)
+            cmd_asm = (
+                f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=asm "
+                f"{STARVE_FLAGS} "
+                f"{ir_file} -o {asm_file}"
+            )
+            if not run_command(cmd_asm):
+                continue
+
+            # 3. COMPILE TO OBJ (For Linking)
+            cmd_obj = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=obj "
                 f"{STARVE_FLAGS} "
                 f"{ir_file} -o {obj_file}"
             )
-            
-            if not run_command(cmd_llc):
-                print(f"  {alloc}: Failed compilation")
-                with open(RESULTS_FILE, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([bench_name, alloc, "CompileFail"])
+            if not run_command(cmd_obj):
                 continue
 
-            # 3. LINK
+            # 4. GATHER STATIC METRICS
+            stats = get_static_metrics(asm_file)
+
+            # 5. LINK & RUN (For Time)
             poly_util = os.path.join(POLYBENCH_ROOT, "utilities/polybench.c")
             cmd_link = f"{CLANG_PATH} {obj_file} {poly_util} -DPOLYBENCH_TIME -o {exe_file} -lm"
             
-            if not run_command(cmd_link):
-                print(f"  {alloc}: Failed linking")
-                with open(RESULTS_FILE, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([bench_name, alloc, "LinkFail"])
-                continue
+            runtime = "Fail"
+            if run_command(cmd_link):
+                print(f"   Testing {alloc}...", end="", flush=True)
+                t = get_exec_time(exe_file)
+                if t is not None:
+                    print(f" {t:.4f}s")
+                    runtime = f"{t:.6f}"
+                else:
+                    print(" Error")
 
-            # 4. RUN
-            print(f"   Testing {alloc}...", end="", flush=True)
-            avg_time = get_exec_time(exe_file)
-            
-            if avg_time is not None:
-                print(f" {avg_time:.4f}s")
-                with open(RESULTS_FILE, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([bench_name, alloc, f"{avg_time:.6f}"])
-            else:
-                print(" Error")
-                with open(RESULTS_FILE, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([bench_name, alloc, "RunFail"])
-            
-            if os.path.exists(exe_file): os.remove(exe_file)
+            # 6. WRITE ROW
+            with open(RESULTS_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    bench_name, 
+                    alloc, 
+                    stats['store'], 
+                    stats['load'], 
+                    stats['move'], 
+                    stats['xor'], 
+                    runtime
+                ])
+
+            # Cleanup
+            if os.path.exists(asm_file): os.remove(asm_file)
             if os.path.exists(obj_file): os.remove(obj_file)
+            if os.path.exists(exe_file): os.remove(exe_file)
 
         if os.path.exists(ir_file): os.remove(ir_file)
 
-    print(f"\nDone! Results saved to {RESULTS_FILE}")
+    print(f"\nDone! Data collected in {RESULTS_FILE}")
 
 if __name__ == "__main__":
     main()
