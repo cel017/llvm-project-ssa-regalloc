@@ -173,8 +173,7 @@ public:
   bool runOnMachineFunction(MachineFunction &mf) override;
 
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::IsSSA);
+    return MachineFunctionProperties();
   }
 
   // Helper for spilling all live virtual registers currently unified under preg
