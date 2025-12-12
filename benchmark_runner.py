@@ -5,48 +5,44 @@ import time
 
 # --- CONFIGURATION ---
 LLC_PATH = "./build_rv1/bin/llc"
-CLANG_PATH = "clang"          # System clang
+CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
 RESULTS_FILE = "results_starved.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
-# Selected benchmarks
 BENCHMARKS = [
-    # Complex Control Flow (Kernels)
+    # BLAS
+    "linear-algebra/blas/gemm/gemm.c",
+    "linear-algebra/blas/syrk/syrk.c",
+
+    # Complex Kernels
     "linear-algebra/kernels/atax/atax.c",
     "linear-algebra/kernels/bicg/bicg.c",
     "linear-algebra/kernels/2mm/2mm.c",
     "linear-algebra/kernels/3mm/3mm.c",
-    
-    # Solvers
-    "linear-algebra/solvers/gramschmidt/gramschmidt.c",
-    "linear-algebra/solvers/lu/lu.c",
-
-    # High Register Pressure (BLAS)
-    "linear-algebra/blas/gemm/gemm.c",
-    "linear-algebra/blas/syrk/syrk.c",
-    "linear-algebra/blas/trmm/trmm.c",
 ]
 
-# --- STARVATION FLAGS ---
-# We manually reserve a huge chunk of RISC-V registers to force spills.
-# 1. Reserve High GPRs (x18-x31 -> s2-s11, t3-t6)
-# 2. Reserve Temps (x5-x7 -> t0-t2)
-# This leaves basically just a0-a7 and s0/s1 available.
+# ---  STARVATION FLAGS (RISC-V) ---
+# Valid Allocatable Regs in RISC-V are usually x5-x31.
 reserved_regs = []
-# Reserve x5-x7 (t0-t2)
-for r in range(5, 8): 
-    reserved_regs.append(f"+reserve-x{r}")
-# Reserve x18-x31 (s2-s11, t3-t6)
-for r in range(18, 32): 
-    reserved_regs.append(f"+reserve-x{r}")
 
-# Construct the flag string: "-mattr=+reserve-x5,+reserve-x6,..."
+# 1. Reserve Temps t0-t2 (x5-x7)
+for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
+
+# 2. Reserve Saved s0-s1 (x8-x9)
+for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
+
+# 3. Reserve High Args a5-a7 (x15-x17)
+# WE LEAVE a0-a4 (x10-x14) AVAILABLE. (5 Registers total)
+for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
+
+# 4. Reserve High Saved/Temps (x18-x31)
+for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
+
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
 
 def run_command(cmd):
-    """Helper to run shell commands silently"""
     try:
         subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
@@ -57,21 +53,19 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
-        for _ in range(3):
+        for _ in range(5): # Run 5 times for Standard Dataset (it's faster)
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
-            if val:
-                times.append(float(val))
+            if val: times.append(float(val))
         if not times: return None
         return sum(times) / len(times)
-    except Exception as e:
+    except Exception:
         return None
 
 def main():
     print(f"Starting Benchmark Suite using LLC: {LLC_PATH}")
-    print(f"--- STARVATION MODE ACTIVE ---")
-    print(f"Reserving {len(reserved_regs)} registers to force spills...")
-
+    print(f"--- MODE: STANDARD DATASET + STARVED REGS (5 Available) ---")
+    
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Benchmark"] + ALLOCATORS)
@@ -84,14 +78,14 @@ def main():
         print(f"--- Processing: {bench_name} ---")
         row_data = [bench_name]
 
-        # 1. EMIT IR
-        # Back to standard -O1 (no loop unrolling needed now)
+        # 1. EMIT IR (System Clang)
+        # Changed to STANDARD_DATASET (Safe for stack)
         ir_file = f"{bench_name}.ll"
         cmd_ir = (
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
             f"-I {POLYBENCH_ROOT}/utilities "
             f"-I {bench_dir} "
-            f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS -DLARGE_DATASET"
+            f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS -DSTANDARD_DATASET"
         )
         
         if not run_command(cmd_ir):
@@ -102,8 +96,8 @@ def main():
             obj_file = f"{bench_name}_{alloc}.o"
             exe_file = f"./{bench_name}_{alloc}"
             
-            # 2. COMPILE TO OBJECT (Custom LLC + Starvation)
-            # We inject STARVE_FLAGS here
+            # 2. COMPILE (Custom LLC)
+            # Injecting STARVE_FLAGS
             cmd_llc = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=obj "
                 f"{STARVE_FLAGS} "
@@ -111,7 +105,8 @@ def main():
             )
             
             if not run_command(cmd_llc):
-                row_data.append("CompileFail")
+                # Basic might fail with "ran out of registers" if 5 is too tight
+                row_data.append("RegsExhausted")
                 continue
 
             # 3. LINK
@@ -130,17 +125,15 @@ def main():
                 print(f" {avg_time:.4f}s")
                 row_data.append(f"{avg_time:.6f}")
             else:
-                print(" Error/Segfault")
+                print(" Error")
                 row_data.append("RunFail")
-
-            # Cleanup
+            
             if os.path.exists(exe_file): os.remove(exe_file)
             if os.path.exists(obj_file): os.remove(obj_file)
 
         with open(RESULTS_FILE, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(row_data)
-
         if os.path.exists(ir_file): os.remove(ir_file)
 
     print(f"\nDone! Results saved to {RESULTS_FILE}")
