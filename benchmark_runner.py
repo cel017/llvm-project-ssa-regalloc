@@ -7,7 +7,7 @@ import time
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_runtime_standard_starved.csv"
+RESULTS_FILE = "results_runtime_heap_starved.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
@@ -22,16 +22,16 @@ BENCHMARKS = [
 
 # --- 1. NUCLEAR STARVATION (5 Regs) ---
 reserved_regs = []
-# Reserve everything except a0-a4
 for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
 for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
 for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
 for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
 
-# --- 2. DATASET (Standard) ---
-# Safe and reliable. Slower runtime (~20s) but fewer crashes.
-SIZE_FLAGS = "-DSTANDARD_DATASET -DPOLYBENCH_STACK_ARRAYS"
+# --- 2. DATASET (Standard + Heap) ---
+# REMOVED: -DPOLYBENCH_STACK_ARRAYS
+# Now using default malloc() behavior.
+SIZE_FLAGS = "-DSTANDARD_DATASET"
 
 def run_command(cmd):
     try:
@@ -43,7 +43,6 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
-        # Run 3 times (Standard dataset is slow)
         for _ in range(3): 
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
@@ -54,8 +53,7 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting RUNTIME Analysis (Standard Dataset + 5 Regs)")
-    print(f"Note: Each run takes ~20s. Please be patient.")
+    print(f"Starting RUNTIME Analysis (Heap Arrays + 5 Regs)")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
