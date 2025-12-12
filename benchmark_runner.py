@@ -94,3 +94,39 @@ def main():
                 f"{STARVE_FLAGS} "
                 f"{ir_file} -o {obj_file}"
             )
+            
+            if not run_command(cmd_llc):
+                row_data.append("Fail")
+                continue
+
+            # 3. LINK
+            poly_util = os.path.join(POLYBENCH_ROOT, "utilities/polybench.c")
+            cmd_link = f"{CLANG_PATH} {obj_file} {poly_util} -DPOLYBENCH_TIME -o {exe_file} -lm"
+            
+            if not run_command(cmd_link):
+                row_data.append("Fail")
+                continue
+
+            # 4. RUN
+            print(f"   Testing {alloc}...", end="", flush=True)
+            avg_time = get_exec_time(exe_file)
+            
+            if avg_time is not None:
+                print(f" {avg_time:.4f}s")
+                row_data.append(f"{avg_time:.6f}")
+            else:
+                print(" Error")
+                row_data.append("RunFail")
+            
+            if os.path.exists(exe_file): os.remove(exe_file)
+            if os.path.exists(obj_file): os.remove(obj_file)
+
+        with open(RESULTS_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row_data)
+        if os.path.exists(ir_file): os.remove(ir_file)
+
+    print(f"\nDone! Results saved to {RESULTS_FILE}")
+
+if __name__ == "__main__":
+    main()
