@@ -7,18 +7,20 @@ import re
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_stats.csv"
+RESULTS_FILE = "results_spill_counts_medium.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
 BENCHMARKS = [
-    "linear-algebra/blas/gemm/gemm.c",
+    "linear-algebra/blas/trmm/trmm.c",
     "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/solvers/lu/lu.c",
     "medley/floyd-warshall/floyd-warshall.c",
+    "medley/deriche/deriche.c",
+    "linear-algebra/blas/gemm/gemm.c",
 ]
 
-# Starvation Flags (5 Regs)
+# --- 1. NUCLEAR STARVATION (5 Regs) ---
 reserved_regs = []
 for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
 for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
@@ -26,13 +28,15 @@ for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
 for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
 
-SIZE_FLAGS = "-DSTANDARD_DATASET -Wno-macro-redefined -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256"
+# --- 2. DATASET (Medium - Fixed) ---
+# We removed STANDARD_DATASET to avoid macro conflicts.
+# We add DATA_TYPE_IS_DOUBLE to ensure math works.
+SIZE_FLAGS = "-DDATA_TYPE_IS_DOUBLE -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256"
 
 def get_llvm_spill_count(stderr_output):
     """
     Parses LLVM -stats output for "Number of spills inserted"
     """
-    # Look for: "  55 regalloc - Number of spills inserted"
     match = re.search(r'\s+(\d+)\s+regalloc\s+-\s+Number of spills inserted', stderr_output)
     if match:
         return int(match.group(1))
@@ -46,7 +50,7 @@ def run_command(cmd):
     return True
 
 def main():
-    print(f"Starting SPILL COUNT Analysis (Using -stats)")
+    print(f"Starting SPILL COUNT Analysis (Medium Dataset + 5 Regs)")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -74,15 +78,14 @@ def main():
 
         for alloc in ALLOCATORS:
             # 2. COMPILE with -stats
-            # We capture stderr because that's where stats are printed
             cmd_llc = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -stats "
                 f"{STARVE_FLAGS} "
-                f"{ir_file} -o /dev/null" # Throw away the object file, we only want stats
+                f"{ir_file} -o /dev/null"
             )
             
             try:
-                # Run and capture stderr
+                # Capture stderr to read stats
                 result = subprocess.run(cmd_llc, shell=True, capture_output=True, text=True)
                 
                 if result.returncode != 0:
@@ -97,7 +100,7 @@ def main():
                     writer.writerow([bench_name, alloc, spills])
             
             except Exception as e:
-                print(f"  {alloc}: Error running llc")
+                print(f"  {alloc}: Execution Error")
 
         if os.path.exists(ir_file): os.remove(ir_file)
 
