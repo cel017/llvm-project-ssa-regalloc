@@ -1498,15 +1498,15 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
     addPass(&TwoAddressInstructionPassID);
     addPass(&RegisterCoalescerID);
+    // The machine scheduler may accidentally create disconnected components
+    // when moving subregister definitions around, avoid this by splitting them to
+    // separate vregs before. Splitting can also improve reg. allocation quality.
+    addPass(&RenameIndependentSubregsID);
+
+    // PreRA instruction scheduling.
+    addPass(&MachineSchedulerID);
   }
 
-  // The machine scheduler may accidentally create disconnected components
-  // when moving subregister definitions around, avoid this by splitting them to
-  // separate vregs before. Splitting can also improve reg. allocation quality.
-  addPass(&RenameIndependentSubregsID);
-
-  // PreRA instruction scheduling.
-  addPass(&MachineSchedulerID);
 
   if (addRegAssignAndRewriteOptimized()) {
 
