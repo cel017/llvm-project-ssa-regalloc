@@ -7,30 +7,25 @@ import time
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_runtime_heap_starved.csv"
+RESULTS_FILE = "results_runtime_baseline.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
 BENCHMARKS = [
-    "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/blas/trmm/trmm.c",
+    "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/solvers/lu/lu.c",
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
     "linear-algebra/blas/gemm/gemm.c",
 ]
 
-# --- 1. NUCLEAR STARVATION (5 Regs) ---
-reserved_regs = []
-for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
-for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
-for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
-for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
-STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
+# --- 1. NO STARVATION (Standard Arch) ---
+# We remove all reserve flags. The allocator has full access to ~32 registers.
+STARVE_FLAGS = ""
 
 # --- 2. DATASET (Standard + Heap) ---
-# REMOVED: -DPOLYBENCH_STACK_ARRAYS
-# Now using default malloc() behavior.
+# Default behavior. Data on Heap. Large size.
 SIZE_FLAGS = "-DSTANDARD_DATASET"
 
 def run_command(cmd):
@@ -43,6 +38,7 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
+        # Run 3 times (Standard dataset is slow, ~10-20s per run)
         for _ in range(3): 
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
@@ -53,7 +49,7 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting RUNTIME Analysis (Heap Arrays + 5 Regs)")
+    print(f"Starting RUNTIME Analysis (Baseline: Full Regs + Standard Dataset)")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
