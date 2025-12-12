@@ -1489,31 +1489,47 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&MachineLoopInfoID);
   
   //------497--------//
+// ============================================================
+  // 1. SSA ALLOCATOR PIPELINE (Explicit Construction)
+  // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-    // Pre-SSA regalloc passes
+    // 1. Pre-Alloc Setup
     addPass(createCriticalEdgeRemovalPass());
-  } else {
-    // Standard pipeline
-    addPass(&PHIEliminationID);
-    if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
-    addPass(&TwoAddressInstructionPassID);
-    addPass(&RegisterCoalescerID);
-    // The machine scheduler may accidentally create disconnected components
-    // when moving subregister definitions around, avoid this by splitting them to
-    // separate vregs before. Splitting can also improve reg. allocation quality.
-    addPass(&RenameIndependentSubregsID);
+    // (Skip PHI Elim, TwoAddress, Scheduler)
 
-    // PreRA instruction scheduling.
-    addPass(&MachineSchedulerID);
+    // 2. The Allocator
+    // We call the factory directly to ensure RASSA is added, not Greedy.
+    addPass(createSSARegisterAllocator());
+
+    // 3. The Rewriter
+    // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
+    addPass(&VirtRegRewriterID);
+
+    addPass(createSSADeconstructionPass());
+
+    // 5. Post-Alloc Optimizations (Standard)
+    addPass(&StackSlotColoringID);
+    addPostRewrite(); // Target hook
+    addPass(&MachineCopyPropagationID);
+    addPass(&MachineLICMID);
+
+    return;
   }
 
+  // Standard pipeline
+  addPass(&PHIEliminationID);
+  if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
+  addPass(&TwoAddressInstructionPassID);
+  addPass(&RegisterCoalescerID);
+  // The machine scheduler may accidentally create disconnected components
+  // when moving subregister definitions around, avoid this by splitting them to
+  // separate vregs before. Splitting can also improve reg. allocation quality.
+  addPass(&RenameIndependentSubregsID);
+
+  // PreRA instruction scheduling.
+  addPass(&MachineSchedulerID);
 
   if (addRegAssignAndRewriteOptimized()) {
-
-    //------497--------//
-    if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-      addPass(createSSADeconstructionPass());
-    }
 
     // Perform stack slot coloring and post-ra machine LICM.
     addPass(&StackSlotColoringID);
