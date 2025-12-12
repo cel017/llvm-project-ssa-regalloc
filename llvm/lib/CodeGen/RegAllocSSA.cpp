@@ -378,7 +378,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
   VRAI.calculateSpillWeightsAndHints();
 
-  // Spill Weights
+  // Fer Spill Weights
   SpillWeightCalculator FSW(MF->getRegInfo(), MLI);
   
   MachineRegisterInfo &MRI = MF->getRegInfo();
@@ -392,7 +392,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LiveInterval &LI = LIS->getInterval(Reg);
     // Overwrite the weight using the Fernando calculator
     // LLVM weights are floats; the paper's are integers.
-    LI.weight = (float)FSW.getWeight(Reg);
+    LI.setWeight((float)FSW.getWeight(Reg));
   }
 
   SpillerInstance.reset(
