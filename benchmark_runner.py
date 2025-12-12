@@ -12,20 +12,20 @@ ALLOCATORS = ["basic", "greedy", "ssa"]
 
 # Selected benchmarks
 BENCHMARKS = [
+    # Complex Control Flow (Kernels)
+    "linear-algebra/kernels/atax/atax.c",
+    "linear-algebra/kernels/bicg/bicg.c",
+    "linear-algebra/kernels/2mm/2mm.c",
+    "linear-algebra/kernels/3mm/3mm.c",
+    
+    # Solvers
+    "linear-algebra/solvers/gramschmidt/gramschmidt.c",
+    "linear-algebra/solvers/lu/lu.c",
+
     # High Register Pressure (BLAS)
     "linear-algebra/blas/gemm/gemm.c",
     "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/blas/trmm/trmm.c",
-
-    # Complex Control Flow (Kernels)
-    "linear-algebra/kernels/2mm/2mm.c",
-    "linear-algebra/kernels/3mm/3mm.c",
-    "linear-algebra/kernels/atax/atax.c",
-    "linear-algebra/kernels/bicg/bicg.c",
-    
-    # Solvers
-    "linear-algebra/solvers/lu/lu.c",
-    "linear-algebra/solvers/gramschmidt/gramschmidt.c",
 ]
 
 def run_command(cmd):
