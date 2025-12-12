@@ -38,8 +38,6 @@ using namespace llvm;
 // Forward declaration
 FunctionPass *llvm::createSSARegisterAllocator();
 
-namespace {
-
 /// Helper to calculate spill weights (User provided logic)
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
@@ -69,7 +67,6 @@ public:
     }
     return W;
   }
-};
 
 /// RASSA: SSA-based Register Allocator
 /// Implements Chordal Graph Coloring via Dominator Tree Traversal
