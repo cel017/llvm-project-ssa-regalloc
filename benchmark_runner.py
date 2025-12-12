@@ -16,7 +16,6 @@ BENCHMARKS = [
     # 1. Triangular Loops (Like SYRK)
     # These have inner loops like 'for (j = 0; j < i; j++)'
     # If the allocator spills 'i', the branch unit stalls.
-    "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/blas/trmm/trmm.c",
 
     # 2. Solvers (Shrinking sub-matrices)
@@ -29,6 +28,10 @@ BENCHMARKS = [
     # These often require keeping multiple neighbors or path indices alive.
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
+
+
+    "linear-algebra/blas/syrk/syrk.c",
+
 ]
 
 # --- NUCLEAR STARVATION FLAGS (RISC-V) ---
