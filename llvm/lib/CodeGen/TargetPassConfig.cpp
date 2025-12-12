@@ -1492,6 +1492,11 @@ if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
     // SSA regalloc passes
     addPass(createCriticalEdgeRemovalPass());
     addPass(&MachineLoopInfoID);
+    addPass(&PHIEliminationID);
+    if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
+    addPass(&TwoAddressInstructionPassID);
+    addPass(&RegisterCoalescerID);
+
   } else {
     // Standard pipeline
     addPass(&MachineLoopInfoID);
