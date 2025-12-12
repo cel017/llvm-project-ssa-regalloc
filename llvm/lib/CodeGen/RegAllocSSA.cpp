@@ -365,21 +365,18 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-  auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); // Needed for Fernando Logic
+  auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
 
   RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
                      getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // 1. Run Standard LLVM Weight Calculation (for hints and setup)
+  // 1. Create VRAI (Needed by Spiller), but DO NOT RUN IT.
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, MLI, MBFI,
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
-  VRAI.calculateSpillWeightsAndHints();
-
-  // Fer Spill Weights
-  SpillWeightCalculator FSW(MF->getRegInfo(), MLI);
   
   MachineRegisterInfo &MRI = MF->getRegInfo();
+  SpillWeightCalculator FSW(MRI, MLI);
   
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
@@ -388,18 +385,18 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
       continue;
 
     LiveInterval &LI = LIS->getInterval(Reg);
-    // Overwrite the weight using the Fernando calculator
-    // LLVM weights are floats; the paper's are integers.
+    
+    // Set the weight using the Fernando calculator
     LI.setWeight((float)FSW.getWeight(Reg));
   }
 
+  // pass VRAI because the interface requires it.
   SpillerInstance.reset(
       createInlineSpiller({*LIS, LiveStks, MDT, MBFI}, *MF, *VRM, VRAI));
 
   allocatePhysRegs();
   postOptimization();
 
-  // Diagnostic output before rewriting
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << *VRM << "\n");
 
   releaseMemory();
