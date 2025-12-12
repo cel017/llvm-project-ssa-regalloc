@@ -5,6 +5,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+//
+// This file defines the RASSA function pass, which provides a Chordal Graph
+// Coloring register allocator based on the "Fernando" implementation, adapted
+// for the modern LLVM infrastructure.
+//
+//===----------------------------------------------------------------------===//
 
 #include "RegAllocBase.h"
 #include "AllocationOrder.h"
@@ -38,7 +44,9 @@ using namespace llvm;
 // Forward declaration
 FunctionPass *llvm::createSSARegisterAllocator();
 
-/// Helper to calculate spill weights
+namespace {
+
+/// Helper to calculate spill weights based on Loop Depth
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
@@ -69,6 +77,8 @@ public:
   }
 };
 
+/// RASSA: SSA-based Register Allocator
+/// Implements Chordal Graph Coloring via Dominator Tree Traversal
 class RASSA : public MachineFunctionPass,
               public RegAllocBase,
               private LiveRangeEdit::Delegate {
@@ -134,6 +144,8 @@ private:
 };
 
 char RASSA::ID = 0;
+
+} // end anonymous namespace
 
 // === Implementation ===
 
@@ -236,8 +248,6 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 // === Fernando Structure Breakdown ===
 
 // Recursive allocation to handle immediate splitting/spilling.
-// This replaces Fernando's `allocate_spilled_uses` logic (which manually found regs for reloads)
-// because modern Spillers create new VRegs for reloads, which we simply recursively color here.
 void RASSA::allocateRegister(const LiveInterval &VirtReg) {
     SmallVector<Register, 4> SplitVRegs;
     MCRegister PhysReg = selectOrSplit(VirtReg, SplitVRegs);
@@ -319,7 +329,31 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   return true;
 }
 
+// 1. Define the create function (Required by the header)
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 
+// 2. Define the Initialization function.
+// CRITICAL: This MUST be inside 'namespace llvm' so the linker finds llvm::initializeRASSAPass
+namespace llvm {
+
+    // We pass RASSA::ID here. Since RASSA is visible in this file, it works.
+    INITIALIZE_PASS_BEGIN(RASSA, "regallocssa", "SSA Register Allocator", false, false)
+    INITIALIZE_PASS_DEPENDENCY(LiveDebugVariablesWrapperLegacy)
+    INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
+    INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
+    INITIALIZE_PASS_DEPENDENCY(RegisterCoalescerLegacy)
+    INITIALIZE_PASS_DEPENDENCY(MachineSchedulerLegacy)
+    INITIALIZE_PASS_DEPENDENCY(LiveStacksWrapperLegacy)
+    INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+    INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+    INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+    INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
+    INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
+    INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
+    INITIALIZE_PASS_END(RASSA, "regallocssa", "SSA Register Allocator", false, false)
+
+} // end namespace llvm
+
+// 3. Register the allocator so -regalloc=ssa works via command line
 static RegisterRegAlloc ssaRegAlloc("ssa", "SSA register allocator",
                                     createSSARegisterAllocator);
