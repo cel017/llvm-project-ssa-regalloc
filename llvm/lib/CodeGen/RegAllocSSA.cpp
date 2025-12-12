@@ -8,7 +8,7 @@
 
 #include "RegAllocBase.h"
 #include "AllocationOrder.h"
-#include "llvm/ADT/DepthFirstIterator.h" // Essential for DomTree walk
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
@@ -38,7 +38,7 @@ using namespace llvm;
 // Forward declaration
 FunctionPass *llvm::createSSARegisterAllocator();
 
-/// Helper to calculate spill weights (User provided logic)
+/// Helper to calculate spill weights
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
@@ -67,9 +67,8 @@ public:
     }
     return W;
   }
+};
 
-/// RASSA: SSA-based Register Allocator
-/// Implements Chordal Graph Coloring via Dominator Tree Traversal
 class RASSA : public MachineFunctionPass,
               public RegAllocBase,
               private LiveRangeEdit::Delegate {
@@ -77,8 +76,6 @@ class RASSA : public MachineFunctionPass,
   MachineFunction *MF = nullptr;
   MachineDominatorTree *MDT = nullptr;
   std::unique_ptr<Spiller> SpillerInstance;
-  
-  // Custom weight calculator
   std::unique_ptr<SpillWeightCalculator> WeightCalc;
 
   // LRE Delegate methods
@@ -94,21 +91,34 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   void releaseMemory() override;
-
   Spiller &spiller() override { return *SpillerInstance; }
 
-  // We do NOT use the priority queue, so these are stubs/no-ops
+  // Unused standard RegAllocBase queue methods
   void enqueueImpl(const LiveInterval *LI) override {} 
   const LiveInterval *dequeue() override { return nullptr; }
 
-  // Core logic methods
+  // --- Core Allocation Logic (Mapped to Fernando's Implementation) ---
+
+  /// 1. Main Driver: Iterates CFG in Dominator Tree Order
+  bool runOnMachineFunction(MachineFunction &mf) override;
+
+  /// 2. Perform Local Allocation: Matches `perform_local_allocation`
+  ///    Iterates instructions in the block.
+  void performLocalAllocation(MachineBasicBlock &MBB);
+
+  /// 3. Allocate Defs: Matches `allocate_defs`
+  ///    Assigns registers to definitions in the current instruction.
+  void allocateDefs(MachineInstr &MI);
+
+  /// 4. Recursive Allocation Helper
+  ///    Handles the actual selection and immediate splitting/coloring.
+  ///    (Combines parts of `allocate_spilled_uses` and `assign_colors`)
+  void allocateRegister(const LiveInterval &VirtReg);
+
+  // --- End Core Logic ---
+
   MCRegister selectOrSplit(const LiveInterval &VirtReg,
                            SmallVectorImpl<Register> &SplitVRegs) override;
-  
-  void allocateRegister(const LiveInterval &VirtReg);
-  void processBlock(MachineBasicBlock *MBB, SmallVectorImpl<Register> &NewVRegs);
-  
-  bool runOnMachineFunction(MachineFunction &mf) override;
 
   MachineFunctionProperties getRequiredProperties() const override {
     return MachineFunctionProperties().set(MachineFunctionProperties::Property::NoPHIs);
@@ -125,8 +135,7 @@ private:
 
 char RASSA::ID = 0;
 
-} 
-
+// === Implementation ===
 
 bool RASSA::LRE_CanEraseVirtReg(Register VirtReg) {
   LiveInterval &LI = LIS->getInterval(VirtReg);
@@ -140,8 +149,6 @@ bool RASSA::LRE_CanEraseVirtReg(Register VirtReg) {
 }
 
 void RASSA::LRE_WillShrinkVirtReg(Register VirtReg) {
-  // Since we don't use a queue, we don't need to re-enqueue.
-  // The interval effectively just gets shorter, which is fine for SSA.
   if (VRM->hasPhys(VirtReg))
     Matrix->unassign(LIS->getInterval(VirtReg));
 }
@@ -175,7 +182,6 @@ void RASSA::releaseMemory() {
   WeightCalc.reset();
 }
 
-// Logic to spill interferences (borrowed from user's skeleton)
 bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
                                SmallVectorImpl<Register> &SplitVRegs) {
   SmallVector<const LiveInterval *, 8> Intfs;
@@ -183,7 +189,6 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
   for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
     LiveIntervalUnion::Query &Q = Matrix->query(VirtReg, Unit);
     for (const auto *Intf : reverse(Q.interferingVRegs())) {
-      // Check spill weights using our custom calculator
       unsigned IntfWeight = WeightCalc->getWeight(Intf->reg());
       unsigned VirtWeight = WeightCalc->getWeight(VirtReg.reg());
 
@@ -202,57 +207,80 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
   return true;
 }
 
-// Logic to select a register or spill the current one
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   SmallVector<MCRegister, 8> PhysRegSpillCands;
   auto Order = AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
 
-  // 1. Try to find a free register
+  // 1. Try free registers
   for (MCRegister PhysReg : Order) {
     if (Matrix->checkInterference(VirtReg, PhysReg) == LiveRegMatrix::IK_Free)
       return PhysReg;
-    
-    // If not free, but only blocked by Virtual Regs, it's a spill candidate
     if (Matrix->checkInterference(VirtReg, PhysReg) == LiveRegMatrix::IK_VirtReg)
       PhysRegSpillCands.push_back(PhysReg);
   }
 
-  // 2. Try to spill existing interferences (Eviction)
+  // 2. Try evicting (spilling) interferences
   for (MCRegister &PhysReg : PhysRegSpillCands) {
-    if (spillInterferences(VirtReg, PhysReg, SplitVRegs)) {
-      // Logic: Fernando's algo liberated colors explicitly. 
-      // Here we unassigned the interference, so checkInterference should now be free.
+    if (spillInterferences(VirtReg, PhysReg, SplitVRegs))
       return PhysReg;
-    }
   }
 
-  // 3. Spill the current register
-  LLVM_DEBUG(dbgs() << "Spilling current: " << VirtReg << '\n');
+  // 3. Spill current
   if (!VirtReg.isSpillable()) return ~0u;
-
   LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
   spiller().spill(LRE);
-  
-  return 0; // 0 indicates we spilled the register we were trying to allocate
+  return 0;
 }
 
-// The core specific to SSA/Chordal coloring:
-// Recursively allocates a specific interval immediately.
-// If it spills, it allocates the split products immediately.
+// === Fernando Structure Breakdown ===
+
+// Recursive allocation to handle immediate splitting/spilling.
+// This replaces Fernando's `allocate_spilled_uses` logic (which manually found regs for reloads)
+// because modern Spillers create new VRegs for reloads, which we simply recursively color here.
 void RASSA::allocateRegister(const LiveInterval &VirtReg) {
     SmallVector<Register, 4> SplitVRegs;
     MCRegister PhysReg = selectOrSplit(VirtReg, SplitVRegs);
 
     if (PhysReg && PhysReg != ~0u) {
-        // Successful allocation
         Matrix->assign(VirtReg, PhysReg);
     } else {
-        // Spilled. The SplitVRegs (new small intervals from loads/stores) 
-        // need to be allocated immediately to maintain the "one pass" invariant.
+        // Recurse on the new split products (loads/stores) immediately
+        // to maintain the "Single Pass" invariant.
         for (Register Reg : SplitVRegs) {
              allocateRegister(LIS->getInterval(Reg));
         }
+    }
+}
+
+// Matches `allocate_defs`
+void RASSA::allocateDefs(MachineInstr &MI) {
+    for (MachineOperand &MO : MI.operands()) {
+        if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
+           Register VirtReg = MO.getReg();
+           if (LIS->hasInterval(VirtReg)) {
+               allocateRegister(LIS->getInterval(VirtReg));
+           }
+        }
+    }
+}
+
+// Matches `perform_local_allocation`
+void RASSA::performLocalAllocation(MachineBasicBlock &MBB) {
+    for (MachineInstr &MI : MBB) {
+        if (MI.isDebugInstr()) continue;
+        
+        // Skip PHIs (handled by elimination pass, not implemented yet)
+        if (MI.isPHI()) continue;
+
+        // Note: `liberate_dead_uses` from Fernando's code is implicit here.
+        // LiveRegMatrix checks interference against LiveIntervals. If a use
+        // ended at the previous index, it automatically stops interfering.
+        
+        // Allocate definitions
+        allocateDefs(MI);
+
+        // Note: `liberate_dead_defs` is also implicit.
     }
 }
 
@@ -268,11 +296,8 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
                      getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // Initialize helper classes
   WeightCalc = std::make_unique<SpillWeightCalculator>(MRI, MLI);
 
-  // We need standard spill weights calculated for the Spiller to work,
-  // even though we use custom logic for comparisons.
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, MLI,
                       getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI(),
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
@@ -283,38 +308,12 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
        getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI()},
       *MF, *VRM, VRAI));
 
-  // Traverse the Dominator Tree.
-  // This guarantees that when we visit a Node, we have visited all its
-  // Strict Dominators (predecessors in the interference graph context).
-
+  // Main Loop: Matches the graph traversal in Fernando's `runOnMachineFunction`
+  // Instead of building a clique list, we traverse the Dominator Tree.
   for (auto *Node : depth_first(MDT)) {
-    MachineBasicBlock *MBB = Node->getBlock();
-
-    // Iterate over instructions in the block
-    for (MachineInstr &MI : *MBB) {
-      if (MI.isDebugInstr()) continue;
-      
-      // SKIP PHI NODES as per constraints. 
-      // In a full implementation, we would handle PHI definition logic here
-      // or rely on a pre-pass to break PHIs.
-      if (MI.isPHI()) continue;
-
-      // In SSA, a Virtual Register is defined exactly once.
-      // We process the allocation at the definition site.
-      for (MachineOperand &MO : MI.operands()) {
-        if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
-           Register VirtReg = MO.getReg();
-           
-           // Ensure we have an interval (sometimes dead code elim might leave weirdness)
-           if (LIS->hasInterval(VirtReg)) {
-               allocateRegister(LIS->getInterval(VirtReg));
-           }
-        }
-      }
-    }
+    performLocalAllocation(*Node->getBlock());
   }
 
-  // Common cleanup
   postOptimization();
   releaseMemory();
   return true;
