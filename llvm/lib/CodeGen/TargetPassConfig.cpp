@@ -1457,7 +1457,7 @@ void TargetPassConfig::addFastRegAlloc() {
 }
 
 namespace llvm {
-  extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
+  extern FunctionPass *createBasicRegisterAllocator(RegAllocFilterFunc);
   extern FunctionPass *createCriticalEdgeRemovalPass();
 }
 
@@ -1488,14 +1488,14 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&MachineLoopInfoID);
   
   //------497--------//
-if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-    // SSA regalloc passes
+  if (RegAlloc == (FunctionPass *(*)())&createBasicRegisterAllocator) {
+    // pre-SSA regalloc passes
     addPass(createCriticalEdgeRemovalPass());
+
     addPass(&PHIEliminationID);
     if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
     addPass(&TwoAddressInstructionPassID);
     addPass(&RegisterCoalescerID);
-
   } else {
     // Standard pipeline
     addPass(&PHIEliminationID);
