@@ -7,55 +7,42 @@ import time
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_control_stress.csv"
+RESULTS_FILE = "results_rv32e.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
-# SPECIFIC "CONTROL STRESS" BENCHMARKS
+# We focus on the benchmarks that showed sensitivity earlier
 BENCHMARKS = [
-    # 1. Triangular Loops (Like SYRK)
-    # These have inner loops like 'for (j = 0; j < i; j++)'
-    # If the allocator spills 'i', the branch unit stalls.
+    # Control Flow Heavy (Expect Greedy/SSA to win)
+    "linear-algebra/blas/syrk/syrk.c",
     "linear-algebra/blas/trmm/trmm.c",
-
-    # 2. Solvers (Shrinking sub-matrices)
-    # These loops start at variable offsets 'for (j = k+1; j < N; j++)'
-    # High pressure on the loop counter 'k'.
+    
+    # Solvers (Complex Liveness)
     "linear-algebra/solvers/lu/lu.c",
     "linear-algebra/solvers/cholesky/cholesky.c",
-
-    # 3. Path Finding / Stencils (Complex Dependencies)
-    # These often require keeping multiple neighbors or path indices alive.
+    
+    # Stencils (Many live neighbors)
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
 
-
-    "linear-algebra/blas/syrk/syrk.c",
-
+    # Dense (Baseline)
+    "linear-algebra/blas/gemm/gemm.c",
 ]
 
-# --- NUCLEAR STARVATION FLAGS (RISC-V) ---
-# We force the compiler to spill by leaving only 5 registers (a0-a4) available.
+# --- RV32E SIMULATION FLAGS ---
+# RV32E only has registers x0 through x15.
+# We reserve x16 through x31 to force the compiler to work with half the register file.
 reserved_regs = []
+for r in range(16, 32): 
+    reserved_regs.append(f"+reserve-x{r}")
 
-# 1. Reserve Temps t0-t2 (x5-x7)
-for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
-
-# 2. Reserve Saved s0-s1 (x8-x9)
-for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
-
-# 3. Reserve High Args a5-a7 (x15-x17)
-# LEAVES a0-a4 (x10-x14) OPEN.
-for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
-
-# 4. Reserve High Saved/Temps (x18-x31)
-for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
-
+# Combine into -mattr flag
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
 
 def run_command(cmd):
     try:
-        subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # stdout is hidden, but we let stderr show up if something crashes
+        subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         print(f"\n!! Command Failed: {cmd}")
         return False
@@ -64,8 +51,8 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
-        # Run 5 times for stability since Standard Dataset is fast
-        for _ in range(5): 
+        # Standard Dataset is slower, so 3 runs is enough
+        for _ in range(3): 
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
             if val: times.append(float(val))
@@ -75,8 +62,8 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting Control-Flow Stress Suite using LLC: {LLC_PATH}")
-    print(f"--- MODE: STANDARD DATASET + NUCLEAR STARVATION (5 Regs) ---")
+    print(f"Starting RV32E Suite (16 Regs) using LLC: {LLC_PATH}")
+    print(f"--- MODE: STANDARD DATASET + x16-x31 RESERVED ---")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -91,7 +78,7 @@ def main():
         row_data = [bench_name]
 
         # 1. EMIT IR (System Clang)
-        # Using STANDARD_DATASET to avoid stack overflows while maintaining pressure
+        # Standard Dataset + O1 (Keep loops intact)
         ir_file = f"{bench_name}.ll"
         cmd_ir = (
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
@@ -109,7 +96,7 @@ def main():
             exe_file = f"./{bench_name}_{alloc}"
             
             # 2. COMPILE (Custom LLC)
-            # Inject Starvation Flags
+            # Injecting RV32E Flags
             cmd_llc = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=obj "
                 f"{STARVE_FLAGS} "
@@ -117,7 +104,7 @@ def main():
             )
             
             if not run_command(cmd_llc):
-                row_data.append("RegsExhausted")
+                row_data.append("Fail")
                 continue
 
             # 3. LINK
@@ -125,7 +112,7 @@ def main():
             cmd_link = f"{CLANG_PATH} {obj_file} {poly_util} -DPOLYBENCH_TIME -o {exe_file} -lm"
             
             if not run_command(cmd_link):
-                row_data.append("LinkFail")
+                row_data.append("Fail")
                 continue
 
             # 4. RUN
@@ -139,7 +126,7 @@ def main():
                 print(" Error")
                 row_data.append("RunFail")
             
-            # Cleanup binaries
+            # Cleanup
             if os.path.exists(exe_file): os.remove(exe_file)
             if os.path.exists(obj_file): os.remove(obj_file)
 
@@ -148,7 +135,6 @@ def main():
             writer = csv.writer(f)
             writer.writerow(row_data)
         
-        # Cleanup IR
         if os.path.exists(ir_file): os.remove(ir_file)
 
     print(f"\nDone! Results saved to {RESULTS_FILE}")
