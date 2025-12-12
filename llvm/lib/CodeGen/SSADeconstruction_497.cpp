@@ -170,7 +170,7 @@ void SSADeconstruction::insertParallelCopies(
   // 2. Emit Ready copies.
   // 3. If no Ready copies exist but list not empty -> Cycle. Break it.
 
-  SmallVector<CopyOp, 4> WorkList = Copies;
+  SmallVector<CopyOp, 4> WorkList(Copies.begin(), Copies.end());
   
   // Find insertion point (Terminator of predecessor)
   // Since we split critical edges, PredMBB flows ONLY to SuccMBB (usually).
