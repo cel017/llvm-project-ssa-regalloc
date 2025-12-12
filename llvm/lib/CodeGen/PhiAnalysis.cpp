@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/PhiAnalysis.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/InitializePasses.h"
@@ -52,7 +53,6 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
 
       unsigned DefIdx = Register::virtReg2Index(DefReg);
 
-      [cite_start]// Union the Definition with every input Operand [cite: 301-302]
       for (unsigned i = 1, e = MI.getNumOperands(); i < e; i += 2) {
         Register UseReg = MI.getOperand(i).getReg();
         

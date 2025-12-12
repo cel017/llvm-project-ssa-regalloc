@@ -170,8 +170,8 @@ public:
   MCRegister selectOrSplit(const LiveInterval &VirtReg,
                            SmallVectorImpl<Register> &SplitVRegs) override;
 
-  // OVERRIDE: We implement the Pre-Order Traversal here
-  void allocatePhysRegs() override;
+  // Implement the Pre-Order Traversal here
+  void allocatePhysRegs();
 
   bool runOnMachineFunction(MachineFunction &mf) override;
 
@@ -396,7 +396,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     if (MRI.reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg))
       continue;
     LiveInterval &LI = LIS->getInterval(Reg);
-    LI.weight = (float)FSW.getWeight(Reg);
+    LI.setWeight((float)FSW.getWeight(Reg));
   }
 
   // 2. Initialize Hints using PhiAnalysis
