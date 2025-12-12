@@ -7,7 +7,7 @@ import re
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_spill_counts_medium.csv"
+RESULTS_FILE = "results_spill_counts_standard_starved.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
@@ -21,6 +21,7 @@ BENCHMARKS = [
 ]
 
 # --- 1. NUCLEAR STARVATION (5 Regs) ---
+# We reserve everything except a0-a4
 reserved_regs = []
 for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
 for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
@@ -28,10 +29,9 @@ for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
 for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}")
 STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
 
-# --- 2. DATASET (Medium - Fixed) ---
-# We removed STANDARD_DATASET to avoid macro conflicts.
-# We add DATA_TYPE_IS_DOUBLE to ensure math works.
-SIZE_FLAGS = "-DDATA_TYPE_IS_DOUBLE -DNI=256 -DNJ=256 -DNK=256 -DNL=256 -DNM=256 -DN=256"
+# --- 2. DATASET (Standard) ---
+# Safe, reliable, but slightly slower (~20s per run)
+SIZE_FLAGS = "-DSTANDARD_DATASET -DPOLYBENCH_STACK_ARRAYS"
 
 def get_llvm_spill_count(stderr_output):
     """
@@ -44,13 +44,15 @@ def get_llvm_spill_count(stderr_output):
 
 def run_command(cmd):
     try:
+        # Hide warnings/errors for IR gen step
         subprocess.check_call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         return False
     return True
 
 def main():
-    print(f"Starting SPILL COUNT Analysis (Medium Dataset + 5 Regs)")
+    print(f"Starting SPILL COUNT Analysis (Standard Dataset + 5 Regs)")
+    print(f"This may take a few minutes per benchmark...")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -69,7 +71,7 @@ def main():
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
             f"-I {POLYBENCH_ROOT}/utilities "
             f"-I {bench_dir} "
-            f"-DPOLYBENCH_TIME -DPOLYBENCH_STACK_ARRAYS {SIZE_FLAGS}"
+            f"-DPOLYBENCH_TIME {SIZE_FLAGS}"
         )
         
         if not run_command(cmd_ir):
