@@ -78,10 +78,11 @@ public:
     unsigned W = 0;
     MachineInstr *DefMI = MRI.getVRegDef(Reg);
 
-    // def
+    // --- 1. Definition Site ---
     if (DefMI) {
       if (DefMI->isPHI()) {
-        for (unsigned i = 0; i < DefMI->getNumOperands(); i += 2) {
+        for (unsigned i = 1, e = DefMI->getNumOperands(); i < e; i += 2) {
+          // i is Value, i+1 is MBB
           MachineBasicBlock *IncomingMBB = DefMI->getOperand(i + 1).getMBB();
           W += 1 + getLoopWeight(IncomingMBB);
         }
@@ -90,13 +91,15 @@ public:
       }
     }
 
-    // use
+    // --- 2. Use Sites ---
     for (MachineInstr &UseMI : MRI.reg_nodbg_instructions(Reg)) {
       if (&UseMI == DefMI) continue;
 
       if (UseMI.isPHI()) {
-        for (unsigned i = 0; i < UseMI.getNumOperands(); i += 2) {
+        for (unsigned i = 1, e = UseMI.getNumOperands(); i < e; i += 2) {
+          // If this operand (Val) matches our register...
           if (UseMI.getOperand(i).isReg() && UseMI.getOperand(i).getReg() == Reg) {
+             // ... then the weight comes from the associated MBB (Val+1)
              MachineBasicBlock *IncomingMBB = UseMI.getOperand(i + 1).getMBB();
              W += 1 + getLoopWeight(IncomingMBB);
           }
