@@ -7,24 +7,32 @@ import time
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_starved.csv"
+RESULTS_FILE = "results_control_stress.csv"
 
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
+# SPECIFIC "CONTROL STRESS" BENCHMARKS
 BENCHMARKS = [
-    # BLAS
-    "linear-algebra/blas/gemm/gemm.c",
+    # 1. Triangular Loops (Like SYRK)
+    # These have inner loops like 'for (j = 0; j < i; j++)'
+    # If the allocator spills 'i', the branch unit stalls.
     "linear-algebra/blas/syrk/syrk.c",
+    "linear-algebra/blas/trmm/trmm.c",
 
-    # Complex Kernels
-    "linear-algebra/kernels/atax/atax.c",
-    "linear-algebra/kernels/bicg/bicg.c",
-    "linear-algebra/kernels/2mm/2mm.c",
-    "linear-algebra/kernels/3mm/3mm.c",
+    # 2. Solvers (Shrinking sub-matrices)
+    # These loops start at variable offsets 'for (j = k+1; j < N; j++)'
+    # High pressure on the loop counter 'k'.
+    "linear-algebra/solvers/lu/lu.c",
+    "linear-algebra/solvers/cholesky/cholesky.c",
+
+    # 3. Path Finding / Stencils (Complex Dependencies)
+    # These often require keeping multiple neighbors or path indices alive.
+    "medley/floyd-warshall/floyd-warshall.c",
+    "medley/deriche/deriche.c",
 ]
 
-# ---  STARVATION FLAGS (RISC-V) ---
-# Valid Allocatable Regs in RISC-V are usually x5-x31.
+# --- NUCLEAR STARVATION FLAGS (RISC-V) ---
+# We force the compiler to spill by leaving only 5 registers (a0-a4) available.
 reserved_regs = []
 
 # 1. Reserve Temps t0-t2 (x5-x7)
@@ -34,7 +42,7 @@ for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")
 for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")
 
 # 3. Reserve High Args a5-a7 (x15-x17)
-# WE LEAVE a0-a4 (x10-x14) AVAILABLE. (5 Registers total)
+# LEAVES a0-a4 (x10-x14) OPEN.
 for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}")
 
 # 4. Reserve High Saved/Temps (x18-x31)
@@ -53,7 +61,8 @@ def run_command(cmd):
 def get_exec_time(exe_path):
     try:
         times = []
-        for _ in range(5): # Run 5 times for Standard Dataset (it's faster)
+        # Run 5 times for stability since Standard Dataset is fast
+        for _ in range(5): 
             result = subprocess.run(exe_path, capture_output=True, text=True, check=True)
             val = result.stdout.strip()
             if val: times.append(float(val))
@@ -63,8 +72,8 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting Benchmark Suite using LLC: {LLC_PATH}")
-    print(f"--- MODE: STANDARD DATASET + STARVED REGS (5 Available) ---")
+    print(f"Starting Control-Flow Stress Suite using LLC: {LLC_PATH}")
+    print(f"--- MODE: STANDARD DATASET + NUCLEAR STARVATION (5 Regs) ---")
     
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -79,7 +88,7 @@ def main():
         row_data = [bench_name]
 
         # 1. EMIT IR (System Clang)
-        # Changed to STANDARD_DATASET (Safe for stack)
+        # Using STANDARD_DATASET to avoid stack overflows while maintaining pressure
         ir_file = f"{bench_name}.ll"
         cmd_ir = (
             f"{CLANG_PATH} -O1 -S -emit-llvm {full_src_path} -o {ir_file} "
@@ -97,7 +106,7 @@ def main():
             exe_file = f"./{bench_name}_{alloc}"
             
             # 2. COMPILE (Custom LLC)
-            # Injecting STARVE_FLAGS
+            # Inject Starvation Flags
             cmd_llc = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=obj "
                 f"{STARVE_FLAGS} "
@@ -105,7 +114,6 @@ def main():
             )
             
             if not run_command(cmd_llc):
-                # Basic might fail with "ran out of registers" if 5 is too tight
                 row_data.append("RegsExhausted")
                 continue
 
@@ -128,12 +136,16 @@ def main():
                 print(" Error")
                 row_data.append("RunFail")
             
+            # Cleanup binaries
             if os.path.exists(exe_file): os.remove(exe_file)
             if os.path.exists(obj_file): os.remove(obj_file)
 
+        # Save immediately
         with open(RESULTS_FILE, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(row_data)
+        
+        # Cleanup IR
         if os.path.exists(ir_file): os.remove(ir_file)
 
     print(f"\nDone! Results saved to {RESULTS_FILE}")
