@@ -12,8 +12,8 @@ RESULTS_FILE = "results_runtime_heap_starved.csv"
 ALLOCATORS = ["basic", "greedy", "ssa"]
 
 BENCHMARKS = [
-    "linear-algebra/blas/trmm/trmm.c",
     "linear-algebra/blas/syrk/syrk.c",
+    "linear-algebra/blas/trmm/trmm.c",
     "linear-algebra/solvers/lu/lu.c",
     "medley/floyd-warshall/floyd-warshall.c",
     "medley/deriche/deriche.c",
