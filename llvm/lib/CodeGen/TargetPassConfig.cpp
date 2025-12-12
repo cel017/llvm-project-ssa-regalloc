@@ -1491,7 +1491,6 @@ void TargetPassConfig::addOptimizedRegAlloc() {
 if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
     // SSA regalloc passes
     addPass(createCriticalEdgeRemovalPass());
-    addPass(&MachineLoopInfoID);
     addPass(&PHIEliminationID);
     if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
     addPass(&TwoAddressInstructionPassID);
@@ -1499,7 +1498,6 @@ if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
 
   } else {
     // Standard pipeline
-    addPass(&MachineLoopInfoID);
     addPass(&PHIEliminationID);
     if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
     addPass(&TwoAddressInstructionPassID);
