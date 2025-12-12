@@ -145,6 +145,10 @@ public:
   /// Return the pass name.
   StringRef getPassName() const override { return "SSA Register Allocator"; }
 
+  MachineFunctionProperties getRequiredProperties() const override {
+    return MachineFunctionProperties().set(
+      MachineFunctionProperties::Property::IsSSA);
+  }
   /// RASSA analysis usage.
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
