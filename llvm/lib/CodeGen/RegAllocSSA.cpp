@@ -51,6 +51,64 @@ FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F);
 
 namespace {
 
+//===----------------------------------------------------------------------===//
+// Implementation of the spill weight calculation from the paper
+//===----------------------------------------------------------------------===//
+class SpillWeightCalculator {
+  const MachineRegisterInfo &MRI;
+  const MachineLoopInfo &MLI;
+
+  static constexpr unsigned Pow10[] = { 
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000 
+  };
+
+  unsigned getLoopWeight(const MachineBasicBlock *MBB) const {
+    unsigned Depth = MLI.getLoopDepth(MBB);
+    if (Depth >= std::size(Pow10)) Depth = std::size(Pow10) - 1;
+    return Pow10[Depth];
+  }
+
+public:
+  SpillWeightCalculator(const MachineRegisterInfo &mri, const MachineLoopInfo &mli) 
+    : MRI(mri), MLI(mli) {}
+
+  unsigned getWeight(Register Reg) const {
+    if (!Reg.isVirtual()) return 0;
+
+    unsigned W = 0;
+    MachineInstr *DefMI = MRI.getVRegDef(Reg);
+
+    // def
+    if (DefMI) {
+      if (DefMI->isPHI()) {
+        for (unsigned i = 0; i < DefMI->getNumOperands(); i += 2) {
+          MachineBasicBlock *IncomingMBB = DefMI->getOperand(i + 1).getMBB();
+          W += 1 + getLoopWeight(IncomingMBB);
+        }
+      } else {
+        W += 1 + getLoopWeight(DefMI->getParent());
+      }
+    }
+
+    // use
+    for (MachineInstr &UseMI : MRI.reg_nodbg_instructions(Reg)) {
+      if (&UseMI == DefMI) continue;
+
+      if (UseMI.isPHI()) {
+        for (unsigned i = 0; i < UseMI.getNumOperands(); i += 2) {
+          if (UseMI.getOperand(i).isReg() && UseMI.getOperand(i).getReg() == Reg) {
+             MachineBasicBlock *IncomingMBB = UseMI.getOperand(i + 1).getMBB();
+             W += 1 + getLoopWeight(IncomingMBB);
+          }
+        }
+      } else {
+        W += 1 + getLoopWeight(UseMI.getParent());
+      }
+    }
+    return W;
+  }
+};
+
 struct CompSpillWeight {
   bool operator()(const LiveInterval *A, const LiveInterval *B) const {
     return A->weight() < B->weight();
@@ -309,14 +367,32 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); // Needed for Fernando Logic
 
   RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
                      getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM,
-                      getAnalysis<MachineLoopInfoWrapperPass>().getLI(), MBFI,
+
+  // 1. Run Standard LLVM Weight Calculation (for hints and setup)
+  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, MLI, MBFI,
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
   VRAI.calculateSpillWeightsAndHints();
+
+  // 2. Overwrite Spill Weights with Paper's Logic
+  FernandoSpillWeightCalculator FSW(MF->getRegInfo(), MLI);
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    // Only process if the register is in use and has a LiveInterval
+    if (MRI.reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg))
+      continue;
+
+    LiveInterval &LI = LIS->getInterval(Reg);
+    // Overwrite the weight using the Fernando calculator
+    // LLVM weights are floats; the paper's are integers.
+    LI.weight = (float)FSW.getWeight(Reg);
+  }
 
   SpillerInstance.reset(
       createInlineSpiller({*LIS, LiveStks, MDT, MBFI}, *MF, *VRM, VRAI));
