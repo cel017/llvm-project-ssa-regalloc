@@ -378,8 +378,9 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
   VRAI.calculateSpillWeightsAndHints();
 
-  // 2. Overwrite Spill Weights with Paper's Logic
-  FernandoSpillWeightCalculator FSW(MF->getRegInfo(), MLI);
+  // Spill Weights
+  SpillWeightCalculator FSW(MF->getRegInfo(), MLI);
+  
   MachineRegisterInfo &MRI = MF->getRegInfo();
   
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
