@@ -1456,6 +1456,11 @@ void TargetPassConfig::addFastRegAlloc() {
   addRegAssignAndRewriteFast();
 }
 
+namespace llvm {
+  extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
+  extern FunctionPass *createCriticalEdgeRemovalPass();
+}
+
 /// Add standard target-independent passes that are tightly coupled with
 /// optimized register allocation, including coalescing, machine instruction
 /// scheduling, and register allocation itself.
@@ -1481,14 +1486,20 @@ void TargetPassConfig::addOptimizedRegAlloc() {
 
   // Edge splitting is smarter with machine loop info.
   addPass(&MachineLoopInfoID);
-  addPass(&PHIEliminationID);
-
-  // Eventually, we want to run LiveIntervals before PHI elimination.
-  if (EarlyLiveIntervals)
-    addPass(&LiveIntervalsID);
-
-  addPass(&TwoAddressInstructionPassID);
-  addPass(&RegisterCoalescerID);
+  
+  //------497--------//
+  // SSA regalloc passes
+  if (RegAlloc == createSSARegisterAllocator) {
+    addPass(createCriticalEdgeRemovalPass());
+    addPass(&MachineLoopInfoID);
+  } else {
+  // Standard pipeline
+    addPass(&MachineLoopInfoID);
+    addPass(&PHIEliminationID);
+    if (EarlyLiveIntervals) addPass(&LiveIntervalsID);
+    addPass(&TwoAddressInstructionPassID);
+    addPass(&RegisterCoalescerID);
+  }
 
   // The machine scheduler may accidentally create disconnected components
   // when moving subregister definitions around, avoid this by splitting them to
