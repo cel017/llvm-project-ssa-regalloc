@@ -303,17 +303,28 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 //===----------------------------------------------------------------------===//
 // Helper: Isolate PHIs to prevent Spiller crashes
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Helper: Isolate PHIs to prevent Spiller crashes
+// Fixed: Uses a vector to avoid infinite loops when inserting instructions.
+//===----------------------------------------------------------------------===//
 void isolatePhis(MachineFunction &MF) {
   MachineRegisterInfo &MRI = MF.getRegInfo();
 
   for (MachineBasicBlock &MBB : MF) {
-    // 1. Find the safe insertion point (after PHIs)
+    // 1. Collect PHIs into a vector to avoid iterator invalidation/infinite loops
+    SmallVector<MachineInstr*, 8> Phis;
+    for (MachineInstr &MI : MBB) {
+      if (!MI.isPHI()) break; // PHIs are always at the top
+      Phis.push_back(&MI);
+    }
+
+    if (Phis.empty()) continue;
+
     MachineBasicBlock::iterator InsertPos = MBB.getFirstNonPHI();
 
-    // 2. Iterate over PHIs
-    for (auto I = MBB.begin(); I != InsertPos; ++I) {
-      MachineInstr &PhiMI = *I;
-      Register PhiDef = PhiMI.getOperand(0).getReg();
+    // 2. Iterate over the collected PHIs
+    for (MachineInstr *PhiMI : Phis) {
+      Register PhiDef = PhiMI->getOperand(0).getReg();
 
       if (!PhiDef.isVirtual()) continue;
 
