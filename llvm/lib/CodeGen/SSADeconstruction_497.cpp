@@ -7,9 +7,9 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
-#include "llvm/CodeGen/LiveIntervals.h" // <--- Added
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallPtrSet.h" // Needed for Visited set
 #include "llvm/Support/Debug.h"
 #include "llvm/CodeGen/Passes.h"
 
@@ -29,7 +29,6 @@ class SSADeconstruction : public MachineFunctionPass {
   const TargetRegisterInfo *TRI = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   VirtRegMap *VRM = nullptr;
-  LiveIntervals *LIS = nullptr; // <--- Added
 
 public:
   static char ID;
@@ -43,7 +42,6 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     AU.addRequired<VirtRegMapWrapperLegacy>(); 
-    AU.addRequired<LiveIntervalsWrapperPass>(); // <--- Added
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
@@ -57,6 +55,9 @@ private:
   
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator I, 
                 MCRegister R1, MCRegister R2) const;
+                
+  // Helper to trace liveness without relying on stale LiveIntervals
+  void propagateLiveIn(MCRegister PhysReg, Register VReg, MachineBasicBlock *DefMBB);
 };
 
 } // end anonymous namespace
@@ -77,7 +78,6 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
   TRI = MF.getSubtarget().getRegisterInfo();
   MRI = &MF.getRegInfo();
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
-  LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS(); // <--- Fetch LIS
 
   bool Changed = false;
 
@@ -93,6 +93,44 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
   return Changed;
 }
 
+// Trace liveness from Uses up to the DefMBB
+void SSADeconstruction::propagateLiveIn(MCRegister PhysReg, Register VReg, MachineBasicBlock *DefMBB) {
+    SmallVector<MachineBasicBlock*, 8> Worklist;
+    SmallPtrSet<MachineBasicBlock*, 16> Visited;
+
+    // 1. Definition Block ALWAYS needs LiveIn (value flows from Predecessors via copies)
+    if (!DefMBB->isLiveIn(PhysReg))
+        DefMBB->addLiveIn(PhysReg);
+        
+    Visited.insert(DefMBB); // Stop traversal here
+
+    // 2. Find all User Blocks
+    for (MachineInstr &UseMI : MRI->use_nodbg_instructions(VReg)) {
+        MachineBasicBlock *UseMBB = UseMI.getParent();
+        // If use is in a different block, start searching up
+        if (UseMBB != DefMBB && Visited.insert(UseMBB).second) {
+            Worklist.push_back(UseMBB);
+        }
+    }
+
+    // 3. BFS up the CFG
+    while (!Worklist.empty()) {
+        MachineBasicBlock *Curr = Worklist.pop_back_val();
+
+        // Mark Live-In
+        if (!Curr->isLiveIn(PhysReg)) {
+            Curr->addLiveIn(PhysReg);
+        }
+
+        // Push Predecessors
+        for (MachineBasicBlock *Pred : Curr->predecessors()) {
+            if (Visited.insert(Pred).second) {
+                Worklist.push_back(Pred);
+            }
+        }
+    }
+}
+
 void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
   DenseMap<MachineBasicBlock*, SmallVector<CopyOp, 4>> ParallelCopies;
 
@@ -105,22 +143,12 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     if (!PhysDef) {
        ++I; continue; 
     }
+
+    // >>> ROBUST FIX: Update Live-Ins via Use-Def BFS <<<
+    // This marks MBB and all blocks on the path to uses as LiveIn(PhysDef).
+    propagateLiveIn(PhysDef, DefVReg, &MBB);
     
-    // >>> FIX: Propagate Live-Ins Globally <<<
-    // Since we are replacing DefVReg with PhysDef everywhere, 
-    // any block that had DefVReg as Live-In must now have PhysDef as Live-In.
-    if (LIS->hasInterval(DefVReg)) {
-        const LiveInterval &LI = LIS->getInterval(DefVReg);
-        for (MachineBasicBlock &AnyMBB : *MBB.getParent()) {
-            if (LIS->isLiveInToMBB(LI, &AnyMBB)) {
-                if (!AnyMBB.isLiveIn(PhysDef)) {
-                    AnyMBB.addLiveIn(PhysDef);
-                }
-            }
-        }
-    }
-    
-    // Collect Copies for Predecessors
+    // Collect Copies
     for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
       Register SrcVReg = Phi.getOperand(i).getReg();
       MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
@@ -147,7 +175,6 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     Register DefVReg = Phi.getOperand(0).getReg();
     MCRegister PhysDef = VRM->getPhys(DefVReg);
 
-    // Rewrite all uses to Physical Register
     if (PhysDef) {
       MRI->replaceRegWith(DefVReg, PhysDef);
     }
@@ -156,7 +183,6 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     Phi.eraseFromParent();
   }
   
-  // Cleanup LiveIns for the current block just in case
   MBB.sortUniqueLiveIns();
 }
 
