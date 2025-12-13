@@ -331,10 +331,12 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
 
-  // PEO traversal
+  // traverse peo
   for (auto *Node : depth_first(MDT.getRootNode())) {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
+
+    SmallVector<Register, 8> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
       if (MI.isDebugInstr()) continue;
@@ -343,21 +345,25 @@ void RASSA::allocatePhysRegs() {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
         
-        // allocate virts that haven't been assigned yet
+        // virts that haven't been assigned yet
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
-          if (!LIS->hasInterval(Reg)) continue; // should not happen if live
-
-          LiveInterval &LI = LIS->getInterval(Reg);
-          
-          // color
-          SmallVector<Register, 4> SplitVRegs;
-          MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
-          
-          if (PhysReg) {
-            // tell llvm its assigned
-            Matrix->assign(LI, PhysReg); 
-          }
+           VRegsToAlloc.push_back(Reg);
         }
+      }
+    }
+
+    // alloc
+    for (Register Reg : VRegsToAlloc) {
+      if (VRM->hasPhys(Reg)) continue; 
+      
+      if (!LIS->hasInterval(Reg)) continue; 
+      LiveInterval &LI = LIS->getInterval(Reg);
+          
+      SmallVector<Register, 4> SplitVRegs;
+      MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
+      
+      if (PhysReg) {
+        Matrix->assign(LI, PhysReg);
       }
     }
   }
