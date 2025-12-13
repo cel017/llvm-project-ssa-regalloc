@@ -331,13 +331,12 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
 
-  // traverse PEO
   for (auto *Node : depth_first(MDT.getRootNode())) {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
-    // collect virt regs
-    SmallVector<Register, 8> VRegsToAlloc;
+    // Collection Phase
+    SmallVector<Register, 16> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
       if (MI.isDebugInstr()) continue;
@@ -345,26 +344,58 @@ void RASSA::allocatePhysRegs() {
       for (MachineOperand &MO : MI.defs()) {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
-        
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
            VRegsToAlloc.push_back(Reg);
         }
       }
     }
 
-    // allocate
+    // Allocation Phase
     for (Register Reg : VRegsToAlloc) {
-      if (VRM->hasPhys(Reg)) continue; 
-      if (!LIS->hasInterval(Reg)) continue; 
+      if (VRM->hasPhys(Reg) || !LIS->hasInterval(Reg)) continue; 
 
       LiveInterval &LI = LIS->getInterval(Reg);
-          
-      // color
+      
+      // CHECK: Is this a PHI definition?
+      bool IsPhiDef = false;
+      if (MachineInstr *DefMI = MRI->getVRegDef(Reg)) {
+        if (DefMI->isPHI()) IsPhiDef = true;
+      }
+
+      // If it is a PHI, we must be careful.
+      // We try to allocate.
       SmallVector<Register, 4> SplitVRegs;
       MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
       
       if (PhysReg) {
         Matrix->assign(LI, PhysReg);
+      } else {
+        // If we failed to allocate (returned 0), it means we SPILLED.
+        // If we spilled a PHI, the InlineSpiller might have inserted code 
+        // at the top of MBB.
+        
+        // REPAIR BLOCK: Move any non-PHIs that ended up before PHIs.
+        if (IsPhiDef && !MBB->empty()) {
+           MachineBasicBlock::iterator FirstNonPHI = MBB->getFirstNonPHI();
+           if (FirstNonPHI != MBB->begin()) {
+             // Everything looks fine (PHIs are at top).
+           } else {
+             // ]non-PHIs at the beginning. This is bad if there are PHIs later.
+             // But wait, getFirstNonPHI() scans past PHIs.
+             
+             // Manual scan to find the "Bad" instruction
+             MachineBasicBlock::iterator InsertPos = MBB->getFirstNonPHI();
+             for (auto I = MBB->begin(); I != InsertPos; ) {
+               MachineInstr &BadMI = *I++;
+               if (!BadMI.isPHI()) {
+                 // Found a non-PHI before the PHIs ended]
+                 // Move it to InsertPos
+                 MBB->remove(&BadMI);
+                 MBB->insert(InsertPos, &BadMI);
+               }
+             }
+           }
+        }
       }
     }
   }
