@@ -453,29 +453,29 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   MF = &mf;
 
-  // 1. Initialize RegClassInfo (Critical!)
+  // 1. Initialize RegClassInfo (Crucial!)
   RegClassInfo.runOnMachineFunction(*MF);
 
+  // 2. Fetch Analyses
   auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
 
-  // 2. Isolate PHIs (Fixes PHI Def Spills)
+  // 3. Isolate PHIs (Fixes Definition Spills)
   isolatePhis(*MF, LIS, VRM, SI);
 
-  // ... (Standard Analysis Loading) ...
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
-  // 3. Initialize Base
+  // 4. Init Base
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-
+  
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
   
-  // 4. Calculate Weights & Protect PHIs
+  // 5. Calculate Weights & Apply Safety Constraints
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
@@ -483,11 +483,34 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     
     LiveInterval &LI = LIS.getInterval(Reg);
     
+    // Default Weight
+    LI.setWeight((float)FSW.getWeight(Reg));
+
+    // --- SAFETY CHECK 1: PHI Definitions ---
+    // If defined by PHI, spill is fatal (store before PHI).
     MachineInstr *DefMI = MRI.getVRegDef(Reg);
     if (DefMI && DefMI->isPHI()) {
-      LI.setWeight(1.0e20f); // Infinite weight prevents spilling definitions
-    } else {
-      LI.setWeight((float)FSW.getWeight(Reg));
+      LI.setWeight(1.0e20f); 
+      continue;
+    }
+
+    // --- SAFETY CHECK 2: Live-Ins to PHI Blocks ---
+    // If this register is live-in to a block that has PHIs, 
+    // the spiller might insert a RELOAD at the top (before PHIs).
+    // We must prevent this by making it unspillable.
+    for (const auto &Seg : LI) {
+      // Get the block where this segment starts
+      SlotIndex StartIdx = Seg.start;
+      MachineBasicBlock *MBB = LIS.getMBBFromIndex(StartIdx);
+      
+      // If the segment starts at the block boundary (Live-In)
+      if (MBB && StartIdx == LIS.getMBBStartIdx(MBB)) {
+         // And the block has PHIs...
+         if (!MBB->empty() && MBB->front().isPHI()) {
+             LI.setWeight(1.0e20f);
+             break; // Found a danger zone, stop checking
+         }
+      }
     }
   }
 
@@ -497,15 +520,8 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset(
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
-  // 5. Run Allocation
   allocatePhysRegs();
   
-  // 6. Cleanup Spiller Artifacts (Fixes "PHI after non-PHI")
-  // [Diagram of Block Layout Cleanup]
-  // Before: [RELOAD] -> [PHI] -> [PHI] -> [COPY]  (Illegal)
-  // After:  [PHI] -> [PHI] -> [RELOAD] -> [COPY]  (Legal)
-  cleanupBlockLayout(*MF);
-
   postOptimization();
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
