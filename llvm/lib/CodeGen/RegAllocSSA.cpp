@@ -368,16 +368,16 @@ void RASSA::allocatePhysRegs() {
 
     for (MachineInstr &MI : *MBB) {
       if (MI.isDebugInstr()) continue;
+
       for (MachineOperand &MO : MI.defs()) {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
+        
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
            VRegsToAlloc.push_back(Reg);
         }
       }
     }
-
-    bool Spilled = false; // Track if we spilled anything
 
     for (Register Reg : VRegsToAlloc) {
       if (VRM->hasPhys(Reg)) continue; 
@@ -388,15 +388,16 @@ void RASSA::allocatePhysRegs() {
       SmallVector<Register, 4> SplitVRegs;
       MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
       
+      bool Spilled = !SplitVRegs.empty();
+      if (!PhysReg) Spilled = true;
+
       if (PhysReg) {
         Matrix->assign(LI, PhysReg);
-      } else {
-        Spilled = true;
       }
-    }
-
-    if (Spilled) {
-       normalizeMBB(MBB);
+      
+      if (Spilled) {
+        normalizeMBB(MBB);
+      }
     }
   }
 }
