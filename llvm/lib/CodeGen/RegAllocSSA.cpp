@@ -81,10 +81,9 @@ public:
     unsigned W = 0;
     MachineInstr *DefMI = MRI.getVRegDef(Reg);
 
-    // --- 1. Definition Site ---
+    // Defs
     if (DefMI) {
       if (DefMI->isPHI()) {
-        // Fix: Start at i=1 to skip definition operand 0
         for (unsigned i = 1, e = DefMI->getNumOperands(); i < e; i += 2) {
           MachineBasicBlock *IncomingMBB = DefMI->getOperand(i + 1).getMBB();
           W += 1 + getLoopWeight(IncomingMBB);
@@ -94,7 +93,7 @@ public:
       }
     }
 
-    // --- 2. Use Sites ---
+    // Uses
     for (MachineInstr &UseMI : MRI.reg_nodbg_instructions(Reg)) {
       if (&UseMI == DefMI) continue;
 
@@ -129,8 +128,6 @@ class RASSA : public MachineFunctionPass,
   MachineFunction *MF = nullptr;
   std::unique_ptr<Spiller> SpillerInstance;
   
-  // Note: We don't use this queue for the main allocation loop anymore 
-  // because we use the Pre-Order traversal. It is kept for standard spilling logic.
   std::priority_queue<const LiveInterval *, std::vector<const LiveInterval *>,
                       CompSpillWeight> Queue;
 
@@ -146,7 +143,6 @@ public:
 
   StringRef getPassName() const override { return "SSA Register Allocator"; }
 
-  // Must match IsSSA for our custom pipeline
   MachineFunctionProperties getRequiredProperties() const override {
     return MachineFunctionProperties().set(
       MachineFunctionProperties::Property::IsSSA);
@@ -170,12 +166,12 @@ public:
   MCRegister selectOrSplit(const LiveInterval &VirtReg,
                            SmallVectorImpl<Register> &SplitVRegs) override;
 
-  // Implement the Pre-Order Traversal here
+  // Pre-Order Traversal here
   void allocatePhysRegs();
 
   bool runOnMachineFunction(MachineFunction &mf) override;
 
-  // We do not clear IsSSA because Deconstruction runs later
+  // Do not clear IsSSA because Deconstruction runs later
   MachineFunctionProperties getClearedProperties() const override {
     return MachineFunctionProperties();
   }
@@ -287,18 +283,12 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   
-  // 1. Try to use a Hint from PhiAnalysis
-  // We prioritize "Fixed Points" (registers assigned to phi-related variables).
-  
-  // Get the standard LLVM hint (which we can populate via PhiAnalysis if we wanted strict manual control,
-  // but let's assume MRI hint is populated or we check classes manually).
-  
-  // Access PhiAnalysis to find classmates
+  // access PhiAnalysis to get clique
   auto &PA = getAnalysis<PhiAnalysis>();
   unsigned ClassID = PA.getClass(VirtReg.reg());
   MCRegister BestHint = 0;
 
-  // Simple Hint Logic: If standard MRI hint works, take it.
+  // if standard MRI hint works, take it.
   std::pair<Register, Register> Hint = MRI->getRegAllocationHint(VirtReg.reg());
   if (Hint.second.isPhysical()) {
       MCRegister PhysHint = Hint.second;
@@ -308,7 +298,6 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
       }
   }
 
-  // 2. Standard Allocation Order
   SmallVector<MCRegister, 8> PhysRegSpillCands;
   auto Order = AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
   
@@ -324,7 +313,7 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
     }
   }
 
-  // 3. Spilling (Least Weight Eviction)
+  // Spilling (evict lowest weight)
   for (MCRegister &PhysReg : PhysRegSpillCands) {
     if (!spillInterferences(VirtReg, PhysReg, SplitVRegs)) continue;
     return PhysReg;
@@ -342,14 +331,11 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
 
-  // 1. Traverse Blocks in Pre-Order (DFS of DomTree)
+  // PEO traversal
   for (auto *Node : depth_first(MDT.getRootNode())) {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
-    // 2. Scan instructions for DEFINITIONS
-    // In Chordal Coloring, we color a node when we encounter it in the traversal.
-    // Liveness is implicit via LiveIntervals.
     for (MachineInstr &MI : *MBB) {
       if (MI.isDebugInstr()) continue;
 
@@ -357,16 +343,20 @@ void RASSA::allocatePhysRegs() {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
         
-        // Only allocate Virtual Registers that haven't been assigned yet
+        // allocate virts that haven't been assigned yet
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
-          if (!LIS->hasInterval(Reg)) continue; // Should not happen if live
+          if (!LIS->hasInterval(Reg)) continue; // should not happen if live
 
           LiveInterval &LI = LIS->getInterval(Reg);
           
-          // Color it!
+          // color
           SmallVector<Register, 4> SplitVRegs;
-          selectOrSplit(LI, SplitVRegs);
-        }
+          MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
+          
+          if (PhysReg) {
+            // tell llvm its assigned
+            Matrix->assign(LI, PhysReg); 
+          }
       }
     }
   }
@@ -382,15 +372,14 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
-  // Initialize Analysis
+  // Init Analysis
   RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
                      getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // 1. Calculate Weights (Custom Logic)
+  // Calculate Weights (Custom Logic)
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
-  
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg))
@@ -399,13 +388,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LI.setWeight((float)FSW.getWeight(Reg));
   }
 
-  // 2. Initialize Hints using PhiAnalysis
-  // We can "pre-bias" the MRI hints here if we want global coalescing.
+  // Initialize Hints using PhiAnalysis
   auto &PA = getAnalysis<PhiAnalysis>();
-  // (Optional: You could iterate all vregs, check PA.getClass(), and set MRI hints here)
 
-  // 3. Setup Spiller
-  // Pass VRAI only because factory needs it (do not run calcSpillWeights!)
+  // Setup Spiller
+  // Pass VRAI only because factory needs it
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, MLI, MBFI,
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
   SpillerInstance.reset(
