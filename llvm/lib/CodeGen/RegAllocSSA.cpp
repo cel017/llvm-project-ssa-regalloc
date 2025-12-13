@@ -331,11 +331,12 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
 
-  // traverse peo
+  // traverse PEO
   for (auto *Node : depth_first(MDT.getRootNode())) {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
+    // collect virt regs
     SmallVector<Register, 8> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
@@ -345,20 +346,20 @@ void RASSA::allocatePhysRegs() {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
         
-        // virts that haven't been assigned yet
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
            VRegsToAlloc.push_back(Reg);
         }
       }
     }
 
-    // alloc
+    // allocate
     for (Register Reg : VRegsToAlloc) {
       if (VRM->hasPhys(Reg)) continue; 
-      
       if (!LIS->hasInterval(Reg)) continue; 
+
       LiveInterval &LI = LIS->getInterval(Reg);
           
+      // color
       SmallVector<Register, 4> SplitVRegs;
       MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
       
