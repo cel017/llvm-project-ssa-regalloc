@@ -1,9 +1,4 @@
 //===-- PhiAnalysis.cpp - Phi Congruence Analysis -------------------------===//
-//
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/PhiAnalysis.h"
@@ -51,7 +46,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
       Register DefReg = MI.getOperand(0).getReg();
       if (!DefReg.isVirtual()) continue;
 
-      unsigned DefIdx = TargetRegisterInfo::virtReg2Index(DefReg);
+      unsigned DefIdx = (unsigned)DefReg & ~(1U << 31); //get id
 
       for (unsigned i = 1, e = MI.getNumOperands(); i < e; i += 2) {
         Register UseReg = MI.getOperand(i).getReg();
@@ -59,7 +54,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
         // Only join Virtual Registers. 
         // (Physicals in PHIs are rare in SSA but can happen if pre-colored).
         if (UseReg.isVirtual()) {
-          unsigned UseIdx = TargetRegisterInfo::virtReg2Index(UseReg);
+          unsigned UseIdx = (unsigned)UseReg & ~(1U << 31);;
           Classes.join(DefIdx, UseIdx);
         }
       }
@@ -76,7 +71,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
 unsigned PhiAnalysis::getClass(Register Reg) const {
   if (!Reg.isVirtual()) return 0;
   // Map VirtReg -> Index -> Leader Index
-  return Classes[TargetRegisterInfo::virtReg2Index(Reg)];
+  return Classes[(unsigned)Reg & ~(1U << 31)];
 }
 
 namespace llvm {
