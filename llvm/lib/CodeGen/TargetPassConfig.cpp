@@ -1502,10 +1502,10 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     addPass(createSSARegisterAllocator());
 
     //------------ PostRA ------------//
-    addPass(createSSADeconstructionPass());
 
     // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
+    addPass(createSSADeconstructionPass());
 
     addPass(&StackSlotColoringID);
     addPostRewrite();
