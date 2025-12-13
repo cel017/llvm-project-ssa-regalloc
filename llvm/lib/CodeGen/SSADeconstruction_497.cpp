@@ -9,7 +9,7 @@
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallPtrSet.h" // Needed for Visited set
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/CodeGen/Passes.h"
 
@@ -42,13 +42,13 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     AU.addRequired<VirtRegMapWrapperLegacy>(); 
+    // We explicitly DO NOT require LiveIntervals, as we invalidate it.
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
-  void deconstructBlock(MachineBasicBlock &MBB);
   void insertParallelCopies(MachineBasicBlock &PredMBB, 
                             MachineBasicBlock &SuccMBB,
                             SmallVectorImpl<CopyOp> &Copies);
@@ -56,7 +56,6 @@ private:
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator I, 
                 MCRegister R1, MCRegister R2) const;
                 
-  // Helper to trace liveness without relying on stale LiveIntervals
   void propagateLiveIn(MCRegister PhysReg, Register VReg, MachineBasicBlock *DefMBB);
 };
 
@@ -73,41 +72,23 @@ namespace llvm {
   }
 }
 
-bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
-  TII = MF.getSubtarget().getInstrInfo();
-  TRI = MF.getSubtarget().getRegisterInfo();
-  MRI = &MF.getRegInfo();
-  VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
-
-  bool Changed = false;
-
-  for (MachineBasicBlock &MBB : MF) {
-    if (MBB.empty()) continue;
-    
-    if (MBB.front().isPHI()) {
-      deconstructBlock(MBB);
-      Changed = true;
-    }
-  }
-
-  return Changed;
-}
-
 // Trace liveness from Uses up to the DefMBB
 void SSADeconstruction::propagateLiveIn(MCRegister PhysReg, Register VReg, MachineBasicBlock *DefMBB) {
     SmallVector<MachineBasicBlock*, 8> Worklist;
     SmallPtrSet<MachineBasicBlock*, 16> Visited;
 
-    // 1. Definition Block ALWAYS needs LiveIn (value flows from Predecessors via copies)
+    // 1. The Definition Block itself needs the register Live-In 
+    // (because the value actually comes from the Predecessors via copies)
     if (!DefMBB->isLiveIn(PhysReg))
         DefMBB->addLiveIn(PhysReg);
         
-    Visited.insert(DefMBB); // Stop traversal here
+    Visited.insert(DefMBB); 
 
-    // 2. Find all User Blocks
+    // 2. Find all User Blocks and trace up
     for (MachineInstr &UseMI : MRI->use_nodbg_instructions(VReg)) {
+        if (UseMI.isPHI()) continue; // PHI uses are handled by the split copies
+        
         MachineBasicBlock *UseMBB = UseMI.getParent();
-        // If use is in a different block, start searching up
         if (UseMBB != DefMBB && Visited.insert(UseMBB).second) {
             Worklist.push_back(UseMBB);
         }
@@ -117,12 +98,10 @@ void SSADeconstruction::propagateLiveIn(MCRegister PhysReg, Register VReg, Machi
     while (!Worklist.empty()) {
         MachineBasicBlock *Curr = Worklist.pop_back_val();
 
-        // Mark Live-In
         if (!Curr->isLiveIn(PhysReg)) {
             Curr->addLiveIn(PhysReg);
         }
 
-        // Push Predecessors
         for (MachineBasicBlock *Pred : Curr->predecessors()) {
             if (Visited.insert(Pred).second) {
                 Worklist.push_back(Pred);
@@ -131,66 +110,94 @@ void SSADeconstruction::propagateLiveIn(MCRegister PhysReg, Register VReg, Machi
     }
 }
 
-void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
+bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
+  TII = MF.getSubtarget().getInstrInfo();
+  TRI = MF.getSubtarget().getRegisterInfo();
+  MRI = &MF.getRegInfo();
+  VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
+
+  SmallVector<MachineInstr*, 16> PhisToRemove;
   DenseMap<MachineBasicBlock*, SmallVector<CopyOp, 4>> ParallelCopies;
 
-  MachineBasicBlock::iterator I = MBB.begin();
-  while (I != MBB.end() && I->isPHI()) {
-    MachineInstr &Phi = *I;
-    Register DefVReg = Phi.getOperand(0).getReg();
-    MCRegister PhysDef = VRM->getPhys(DefVReg);
+  // --- PHASE 1: Analysis & Copy Insertion ---
+  // We identify all copies needed and update Liveness, but do not touch the PHIs yet.
+  
+  for (MachineBasicBlock &MBB : MF) {
+    if (MBB.empty() || !MBB.front().isPHI()) continue;
 
-    if (!PhysDef) {
-       ++I; continue; 
-    }
+    for (MachineInstr &Phi : MBB) {
+      if (!Phi.isPHI()) break;
 
-    // >>> ROBUST FIX: Update Live-Ins via Use-Def BFS <<<
-    // This marks MBB and all blocks on the path to uses as LiveIn(PhysDef).
-    propagateLiveIn(PhysDef, DefVReg, &MBB);
-    
-    // Collect Copies
-    for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
-      Register SrcVReg = Phi.getOperand(i).getReg();
-      MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
-      MCRegister PhysSrc = VRM->getPhys(SrcVReg);
+      Register DefVReg = Phi.getOperand(0).getReg();
+      MCRegister PhysDef = VRM->getPhys(DefVReg);
 
-      if (!PhysSrc) continue; 
-      if (PhysDef != PhysSrc) {
-        ParallelCopies[Pred].push_back({PhysDef, PhysSrc});
+      if (!PhysDef) continue; // Spilled?
+
+      // 1. Update Liveness for the Definition
+      // We do this BEFORE rewriting uses so MRI->use_instructions works.
+      propagateLiveIn(PhysDef, DefVReg, &MBB);
+
+      // 2. Collect Copies needed in Predecessors
+      for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
+        Register SrcVReg = Phi.getOperand(i).getReg();
+        MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
+        
+        // Handle case where Src is already physical (rare but possible in mixed code)
+        MCRegister PhysSrc;
+        if (SrcVReg.isPhysical()) {
+             PhysSrc = SrcVReg.asMCReg();
+        } else {
+             PhysSrc = VRM->getPhys(SrcVReg);
+        }
+
+        if (PhysSrc && PhysDef != PhysSrc) {
+          ParallelCopies[Pred].push_back({PhysDef, PhysSrc});
+        }
       }
+
+      PhisToRemove.push_back(&Phi);
     }
-    ++I;
   }
 
-  // Insert Parallel Copies
+  // Insert all Parallel Copies now
   for (auto &Item : ParallelCopies) {
     MachineBasicBlock *Pred = Item.first;
-    insertParallelCopies(*Pred, MBB, Item.second);
+    // We assume Pred flows to the PHI block. 
+    // Note: insertParallelCopies handles the sequentialization.
+    // We pass *Pred as the second arg just as a placeholder for context if needed,
+    // but the function actually inserts at the end of Pred.
+    insertParallelCopies(*Pred, *Pred, Item.second);
   }
 
-  // Remove PHIs and Rewrite Uses
-  I = MBB.begin();
-  while (I != MBB.end() && I->isPHI()) {
-    MachineInstr &Phi = *I;
-    Register DefVReg = Phi.getOperand(0).getReg();
+  // --- PHASE 2: Destruction ---
+  // Now it is safe to remove PHIs and rewrite uses.
+  
+  for (MachineInstr *Phi : PhisToRemove) {
+    Register DefVReg = Phi->getOperand(0).getReg();
     MCRegister PhysDef = VRM->getPhys(DefVReg);
 
     if (PhysDef) {
-      MRI->replaceRegWith(DefVReg, PhysDef);
+       // Rewrite all non-PHI uses to the physical register
+       // Note: replaceRegWith replaces *all* uses. 
+       // Uses in other PHI nodes effectively become "PhysReg inputs", 
+       // which is why we waited until Phase 2 to do this (so we don't process them again).
+       MRI->replaceRegWith(DefVReg, PhysDef);
     }
-
-    ++I;
-    Phi.eraseFromParent();
+    
+    Phi->eraseFromParent();
   }
-  
-  MBB.sortUniqueLiveIns();
+
+  // Cleanup LiveIns lists
+  for (MachineBasicBlock &MBB : MF) {
+    MBB.sortUniqueLiveIns();
+  }
+
+  return !PhisToRemove.empty();
 }
 
 void SSADeconstruction::emitSwap(MachineBasicBlock &MBB, 
                                  MachineBasicBlock::iterator I, 
                                  MCRegister R1, MCRegister R2) const {
-  LLVM_DEBUG(dbgs() << "Emitting Cycle Swap: " << printReg(R1, TRI) 
-                    << " <-> " << printReg(R2, TRI) << "\n");
   BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::COPY), R1).addReg(R2);
 }
 
@@ -234,7 +241,6 @@ void SSADeconstruction::insertParallelCopies(
       MCRegister S = Current.Src;
       
       emitSwap(PredMBB, InsertPos, D, S);
-      
       WorkList.pop_back();
       
       for (auto &Other : WorkList) {
