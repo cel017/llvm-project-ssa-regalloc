@@ -7,6 +7,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/CodeGen/LiveIntervals.h" // <--- Added
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -28,6 +29,7 @@ class SSADeconstruction : public MachineFunctionPass {
   const TargetRegisterInfo *TRI = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   VirtRegMap *VRM = nullptr;
+  LiveIntervals *LIS = nullptr; // <--- Added
 
 public:
   static char ID;
@@ -41,6 +43,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     AU.addRequired<VirtRegMapWrapperLegacy>(); 
+    AU.addRequired<LiveIntervalsWrapperPass>(); // <--- Added
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
@@ -74,13 +77,13 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
   TRI = MF.getSubtarget().getRegisterInfo();
   MRI = &MF.getRegInfo();
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
+  LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS(); // <--- Fetch LIS
 
   bool Changed = false;
 
   for (MachineBasicBlock &MBB : MF) {
     if (MBB.empty()) continue;
     
-    // Process any block that starts with PHIs
     if (MBB.front().isPHI()) {
       deconstructBlock(MBB);
       Changed = true;
@@ -99,17 +102,25 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     Register DefVReg = Phi.getOperand(0).getReg();
     MCRegister PhysDef = VRM->getPhys(DefVReg);
 
-    // 1. Mark Live-In (Crucial for Verifier)
-    if (PhysDef) {
-       if (!MBB.isLiveIn(PhysDef)) {
-         MBB.addLiveIn(PhysDef);
-       }
-    } else {
-       // Should be impossible due to infinite spill weights, but safety check:
+    if (!PhysDef) {
        ++I; continue; 
     }
-
-    // 2. Collect Copies
+    
+    // >>> FIX: Propagate Live-Ins Globally <<<
+    // Since we are replacing DefVReg with PhysDef everywhere, 
+    // any block that had DefVReg as Live-In must now have PhysDef as Live-In.
+    if (LIS->hasInterval(DefVReg)) {
+        const LiveInterval &LI = LIS->getInterval(DefVReg);
+        for (MachineBasicBlock &AnyMBB : *MBB.getParent()) {
+            if (LIS->isLiveInToMBB(LI, &AnyMBB)) {
+                if (!AnyMBB.isLiveIn(PhysDef)) {
+                    AnyMBB.addLiveIn(PhysDef);
+                }
+            }
+        }
+    }
+    
+    // Collect Copies for Predecessors
     for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
       Register SrcVReg = Phi.getOperand(i).getReg();
       MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
@@ -123,19 +134,20 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     ++I;
   }
 
-  // 3. Insert Parallel Copies
+  // Insert Parallel Copies
   for (auto &Item : ParallelCopies) {
     MachineBasicBlock *Pred = Item.first;
     insertParallelCopies(*Pred, MBB, Item.second);
   }
 
-  // 4. Remove PHIs AND Rewrite Uses
+  // Remove PHIs and Rewrite Uses
   I = MBB.begin();
   while (I != MBB.end() && I->isPHI()) {
     MachineInstr &Phi = *I;
     Register DefVReg = Phi.getOperand(0).getReg();
     MCRegister PhysDef = VRM->getPhys(DefVReg);
 
+    // Rewrite all uses to Physical Register
     if (PhysDef) {
       MRI->replaceRegWith(DefVReg, PhysDef);
     }
@@ -144,18 +156,15 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     Phi.eraseFromParent();
   }
   
+  // Cleanup LiveIns for the current block just in case
   MBB.sortUniqueLiveIns();
 }
 
 void SSADeconstruction::emitSwap(MachineBasicBlock &MBB, 
                                  MachineBasicBlock::iterator I, 
                                  MCRegister R1, MCRegister R2) const {
-  // Debug output
   LLVM_DEBUG(dbgs() << "Emitting Cycle Swap: " << printReg(R1, TRI) 
                     << " <-> " << printReg(R2, TRI) << "\n");
-  
-  // Note: Standard COPY is not a true swap, but often works if liveness allows.
-  // A true swap requires XORs or a scratch register.
   BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::COPY), R1).addReg(R2);
 }
 
@@ -175,7 +184,6 @@ void SSADeconstruction::insertParallelCopies(
       MCRegister Dst = It->Dest;
       bool DstIsSource = false;
 
-      // Check for dependencies
       for (const auto &Other : WorkList) {
         if (&Other == &*It) continue;
         if (Other.Src == Dst) {
@@ -194,7 +202,6 @@ void SSADeconstruction::insertParallelCopies(
       }
     }
 
-    // Break Cycles
     if (!Progress && !WorkList.empty()) {
       CopyOp &Current = WorkList.back();
       MCRegister D = Current.Dest;
