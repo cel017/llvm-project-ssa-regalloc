@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/Spiller.h"
@@ -302,19 +303,17 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 
 //===----------------------------------------------------------------------===//
 // Helper: Isolate PHIs to prevent Spiller crashes
+// Updated: Maintains LiveIntervals, SlotIndexes, and VirtRegMap validity.
 //===----------------------------------------------------------------------===//
-//===----------------------------------------------------------------------===//
-// Helper: Isolate PHIs to prevent Spiller crashes
-// Fixed: Uses a vector to avoid infinite loops when inserting instructions.
-//===----------------------------------------------------------------------===//
-void isolatePhis(MachineFunction &MF) {
+void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
   MachineRegisterInfo &MRI = MF.getRegInfo();
+  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
   for (MachineBasicBlock &MBB : MF) {
-    // 1. Collect PHIs into a vector to avoid iterator invalidation/infinite loops
+    // 1. Collect PHIs to avoid iterator invalidation
     SmallVector<MachineInstr*, 8> Phis;
     for (MachineInstr &MI : MBB) {
-      if (!MI.isPHI()) break; // PHIs are always at the top
+      if (!MI.isPHI()) break; 
       Phis.push_back(&MI);
     }
 
@@ -322,29 +321,40 @@ void isolatePhis(MachineFunction &MF) {
 
     MachineBasicBlock::iterator InsertPos = MBB.getFirstNonPHI();
 
-    // 2. Iterate over the collected PHIs
     for (MachineInstr *PhiMI : Phis) {
       Register PhiDef = PhiMI->getOperand(0).getReg();
 
       if (!PhiDef.isVirtual()) continue;
 
-      // 3. Create a COPY: %New = COPY %PhiDef
+      // 2. Create the new register
       const TargetRegisterClass *RC = MRI.getRegClass(PhiDef);
       Register NewReg = MRI.createVirtualRegister(RC);
+      
+      // CRITICAL FIX: Tell VRM about the new register immediately
+      VRM.grow(); 
 
-      BuildMI(MBB, InsertPos, DebugLoc(), 
-              MF.getSubtarget().getInstrInfo()->get(TargetOpcode::COPY), NewReg)
-          .addReg(PhiDef);
+      // 3. Create the COPY instruction: %NewReg = COPY %PhiDef
+      MachineInstr *CopyMI = BuildMI(MBB, InsertPos, DebugLoc(), 
+                                     TII->get(TargetOpcode::COPY), NewReg)
+                                     .addReg(PhiDef);
 
-      // 4. Replace all downstream uses with NewReg
+      // 4. Update SlotIndexes so LIS knows about the new instruction
+      SI.insertMachineInstrInMaps(*CopyMI);
+
+      // 5. Replace all uses of PhiDef with NewReg (except the COPY source)
       for (MachineOperand &UseMO : llvm::make_early_inc_range(MRI.use_operands(PhiDef))) {
         MachineInstr *UseMI = UseMO.getParent();
-        // Skip the COPY we just made
-        if (UseMI->getParent() == &MBB && UseMI->isCopy() && 
-            UseMI->getOperand(0).getReg() == NewReg) continue;
+        // Skip the COPY we just made (it uses PhiDef as source)
+        if (UseMI == CopyMI) continue;
         
         UseMO.setReg(NewReg);
       }
+
+      // 6. Compute Liveness for the new register
+      // Now that definitions and uses are set, we can calculate the interval.
+      LIS.createAndComputeVirtRegInterval(NewReg);
+
+      // (Optional) We could shrink PhiDef's interval here, but it's safe to leave it loose.
     }
   }
 }
@@ -397,10 +407,15 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
                     << "********** Function: " << mf.getName() << '\n');
 
   MF = &mf;
-
-  // >>> CRITICAL FIX: Isolate PHIs before anything else <<<
-  isolatePhis(*MF);
-
+  
+  // 1. Fetch Analysis Passes needed for updates
+  // We need these to update the graph structure safely
+  auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
+  auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
+  auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
+  // 2. Isolate PHIs (Modifies Graph and Updates Analyses)
+  
+  isolatePhis(*MF, LIS, VRM, SI);
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
