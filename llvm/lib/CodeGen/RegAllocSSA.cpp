@@ -357,6 +357,7 @@ void RASSA::allocatePhysRegs() {
             // tell llvm its assigned
             Matrix->assign(LI, PhysReg); 
           }
+        }
       }
     }
   }
