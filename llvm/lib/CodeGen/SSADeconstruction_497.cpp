@@ -98,25 +98,24 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     MachineInstr &Phi = *I;
     Register DefVReg = Phi.getOperand(0).getReg();
     MCRegister PhysDef = VRM->getPhys(DefVReg);
-    
-    // >>> FIX: Update Live-Ins <<<
-    // The value now flows into this block via PhysDef.
-    // We must tell LLVM that PhysDef is live-in, otherwise the Verifier complains.
+
+    // 1. Mark Live-In (Crucial for Verifier)
     if (PhysDef) {
-       MBB.addLiveIn(PhysDef);
+       if (!MBB.isLiveIn(PhysDef)) {
+         MBB.addLiveIn(PhysDef);
+       }
     } else {
-       // If PhysDef is 0, it means the PHI def was spilled.
-       // The Rewriter will handle the reload, but we can't add 0 to LiveIn.
-       ++I; continue;
+       // Should be impossible due to infinite spill weights, but safety check:
+       ++I; continue; 
     }
 
+    // 2. Collect Copies
     for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
       Register SrcVReg = Phi.getOperand(i).getReg();
       MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
       MCRegister PhysSrc = VRM->getPhys(SrcVReg);
 
       if (!PhysSrc) continue; 
-
       if (PhysDef != PhysSrc) {
         ParallelCopies[Pred].push_back({PhysDef, PhysSrc});
       }
@@ -124,21 +123,27 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     ++I;
   }
 
-  // Insert copies in predecessors
+  // 3. Insert Parallel Copies
   for (auto &Item : ParallelCopies) {
     MachineBasicBlock *Pred = Item.first;
     insertParallelCopies(*Pred, MBB, Item.second);
   }
 
-  // Remove PHIs
+  // 4. Remove PHIs AND Rewrite Uses
   I = MBB.begin();
   while (I != MBB.end() && I->isPHI()) {
-    MachineInstr *Phi = &*I;
+    MachineInstr &Phi = *I;
+    Register DefVReg = Phi.getOperand(0).getReg();
+    MCRegister PhysDef = VRM->getPhys(DefVReg);
+
+    if (PhysDef) {
+      MRI->replaceRegWith(DefVReg, PhysDef);
+    }
+
     ++I;
-    Phi->eraseFromParent();
+    Phi.eraseFromParent();
   }
   
-  // Clean up the LiveIn list (sort/unique) to keep the verifier happy
   MBB.sortUniqueLiveIns();
 }
 
