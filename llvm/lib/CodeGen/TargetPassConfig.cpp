@@ -1494,7 +1494,7 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
     // Pre RA //
-    addPass(createCriticalEdgeRemovalPass());
+    //addPass(createCriticalEdgeRemovalPass());
     // (Skip PHI Elim, TwoAddress, Scheduler) to not break SSA
 
     // RA //
