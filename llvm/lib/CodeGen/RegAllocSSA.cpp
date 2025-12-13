@@ -396,8 +396,6 @@ void RASSA::allocatePhysRegs() {
       if (PhysReg) {
         Matrix->assign(LI, PhysReg);
       }
-      // Note: We do NOT need normalizeMBB here anymore because isolatePhis 
-      // ensures any spills happen at the COPY, which is safely after the PHIs.
     }
   }
 }
@@ -407,43 +405,42 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
                     << "********** Function: " << mf.getName() << '\n');
 
   MF = &mf;
-  
-  // 1. Fetch Analysis Passes needed for updates
-  // We need these to update the graph structure safely
+
   auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
-  // 2. Isolate PHIs (Modifies Graph and Updates Analyses)
-  
+
   isolatePhis(*MF, LIS, VRM, SI);
+
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
-  RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
-                     getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
-                     getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
+  RegAllocBase::init(&VRM, &LIS, &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
-    if (MRI.reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg))
+    if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
       continue;
-    LiveInterval &LI = LIS->getInterval(Reg);
+    
+    LiveInterval &LI = LIS.getInterval(Reg);
     LI.setWeight((float)FSW.getWeight(Reg));
   }
 
-  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, MLI, MBFI,
+  VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI,
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
+  
   SpillerInstance.reset(
-      createInlineSpiller({*LIS, LiveStks, MDT, MBFI}, *MF, *VRM, VRAI));
+      createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
   allocatePhysRegs();
   
   postOptimization();
-  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << *VRM << "\n");
+  // FIX: Remove dereference
+  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
   return true;
 }
