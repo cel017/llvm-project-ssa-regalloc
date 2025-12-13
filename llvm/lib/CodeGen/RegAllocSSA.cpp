@@ -27,7 +27,7 @@
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
-#include "llvm/CodeGen/MachineInstrBuilder.h" // Needed for BuildMI
+#include "llvm/CodeGen/MachineInstrBuilder.h" 
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
@@ -51,7 +51,9 @@ FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F);
 
 namespace {
 
-// Helper: Spill Weight Calculator
+//===----------------------------------------------------------------------===//
+// Spill Weight Calculator
+//===----------------------------------------------------------------------===//
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
@@ -107,6 +109,9 @@ struct CompSpillWeight {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// RASSA Class
+//===----------------------------------------------------------------------===//
 class RASSA : public MachineFunctionPass,
               public RegAllocBase,
               private LiveRangeEdit::Delegate {
@@ -260,9 +265,8 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   
-  // Hint Logic
-  auto &PA = getAnalysis<PhiAnalysis>();
-  // (Optional: Use PA.getClass(VirtReg.reg()) to find preference)
+  // Hint Logic (Optional)
+  // auto &PA = getAnalysis<PhiAnalysis>();
 
   std::pair<Register, Register> Hint = MRI->getRegAllocationHint(VirtReg.reg());
   if (Hint.second.isPhysical()) {
@@ -294,7 +298,7 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
     return PhysReg;
   }
 
-  // SAFETY CHECK: Fatal error if we can't spill
+  // SAFETY CHECK
   if (!VirtReg.isSpillable()) {
      report_fatal_error("RegAllocSSA: Unable to allocate or spill register " + 
                        Twine(VirtReg.reg().id()));
@@ -302,19 +306,18 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
 
   LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
   spiller().spill(LRE);
-  return 0; // Return 0 = Handled by Spilling
+  return 0; 
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: Isolate PHIs to prevent Spiller crashes
-// Updated: Maintains LiveIntervals, SlotIndexes, and VirtRegMap validity.
+// Helper: Isolate PHIs
 //===----------------------------------------------------------------------===//
 void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
   MachineRegisterInfo &MRI = MF.getRegInfo();
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
   for (MachineBasicBlock &MBB : MF) {
-    // 1. Collect PHIs to avoid iterator invalidation
+    // 1. Collect PHIs
     SmallVector<MachineInstr*, 8> Phis;
     for (MachineInstr &MI : MBB) {
       if (!MI.isPHI()) break; 
@@ -327,44 +330,41 @@ void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotI
 
     for (MachineInstr *PhiMI : Phis) {
       Register PhiDef = PhiMI->getOperand(0).getReg();
-
       if (!PhiDef.isVirtual()) continue;
 
       // 2. Create the new register
       const TargetRegisterClass *RC = MRI.getRegClass(PhiDef);
       Register NewReg = MRI.createVirtualRegister(RC);
       
-      // CRITICAL FIX: Tell VRM about the new register immediately
       VRM.grow(); 
 
-      // 3. Create the COPY instruction: %NewReg = COPY %PhiDef
+      // 3. Create the COPY instruction
       MachineInstr *CopyMI = BuildMI(MBB, InsertPos, DebugLoc(), 
                                      TII->get(TargetOpcode::COPY), NewReg)
                                      .addReg(PhiDef);
 
-      // 4. Update SlotIndexes so LIS knows about the new instruction
       SI.insertMachineInstrInMaps(*CopyMI);
 
-      // 5. Replace all uses of PhiDef with NewReg (except the COPY source)
+      // 4. Replace downstream uses
       for (MachineOperand &UseMO : llvm::make_early_inc_range(MRI.use_operands(PhiDef))) {
         MachineInstr *UseMI = UseMO.getParent();
-        // Skip the COPY we just made (it uses PhiDef as source)
         if (UseMI == CopyMI) continue;
-        
         UseMO.setReg(NewReg);
       }
 
-      // 6. Compute Liveness for the new register
-      // Now that definitions and uses are set, we can calculate the interval.
+      // 5. Update Liveness for BOTH registers
       LIS.createAndComputeVirtRegInterval(NewReg);
 
-      // (Optional) We could shrink PhiDef's interval here, but it's safe to leave it loose.
+      // CRITICAL: The old PHI register's live interval is now stale (it used to reach the end of the block).
+      // We must recompute it, otherwise it still "interferes" with everything, causing more spills.
+      LIS.removeInterval(PhiDef);
+      LIS.createAndComputeVirtRegInterval(PhiDef);
     }
   }
 }
 
 //===----------------------------------------------------------------------===//
-// Pre-Order Traversal Allocation
+// Pre-Order Traversal
 //===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
@@ -373,7 +373,6 @@ void RASSA::allocatePhysRegs() {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
-    // Collect VRegs first to avoid iterator invalidation
     SmallVector<Register, 16> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
@@ -387,7 +386,6 @@ void RASSA::allocatePhysRegs() {
       }
     }
 
-    // Allocate
     for (Register Reg : VRegsToAlloc) {
       if (VRM->hasPhys(Reg)) continue; 
       if (!LIS->hasInterval(Reg)) continue; 
@@ -404,16 +402,24 @@ void RASSA::allocatePhysRegs() {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Main Driver
+//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   LLVM_DEBUG(dbgs() << "********** SSA REGISTER ALLOCATION **********\n"
                     << "********** Function: " << mf.getName() << '\n');
 
   MF = &mf;
 
+  // >>> [CRITICAL FIX] Initialize RegClassInfo <<<
+  // Without this, AllocationOrder returns empty, forcing spills immediately!
+  RegClassInfo.runOnMachineFunction(*MF);
+
   auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
 
+  // Isolate PHIs to create safe spill points
   isolatePhis(*MF, LIS, VRM, SI);
 
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
@@ -421,9 +427,10 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
+  // Initialize Base
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
-MachineRegisterInfo &MRI = MF->getRegInfo();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
   
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
@@ -433,10 +440,10 @@ MachineRegisterInfo &MRI = MF->getRegInfo();
     
     LiveInterval &LI = LIS.getInterval(Reg);
     
+    // Safety Net: Increase weight for PHI defs
     MachineInstr *DefMI = MRI.getVRegDef(Reg);
-    bool IsPhiDef = DefMI && DefMI->isPHI();
-    if (IsPhiDef) {
-      LI.setWeight(1.0e20f); // Huge weight
+    if (DefMI && DefMI->isPHI()) {
+      LI.setWeight(1.0e20f); 
     } else {
       LI.setWeight((float)FSW.getWeight(Reg));
     }
@@ -451,7 +458,6 @@ MachineRegisterInfo &MRI = MF->getRegInfo();
   allocatePhysRegs();
   
   postOptimization();
-  // FIX: Remove dereference
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
   return true;
