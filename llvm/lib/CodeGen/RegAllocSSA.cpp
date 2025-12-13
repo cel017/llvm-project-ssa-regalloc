@@ -415,6 +415,7 @@ void RASSA::allocatePhysRegs() {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
+    // 1. Collect initial VRegs
     SmallVector<Register, 16> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
@@ -428,7 +429,10 @@ void RASSA::allocatePhysRegs() {
       }
     }
 
-    for (Register Reg : VRegsToAlloc) {
+    // 2. Iterate using an index so we can handle new registers appended during the loop
+    for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
+      Register Reg = VRegsToAlloc[i];
+
       if (VRM->hasPhys(Reg)) continue; 
       if (!LIS->hasInterval(Reg)) continue; 
 
@@ -439,6 +443,12 @@ void RASSA::allocatePhysRegs() {
       
       if (PhysReg) {
         Matrix->assign(LI, PhysReg);
+      }
+
+      // If spilling created new registers (e.g., Reloads), we must allocate them NOW.
+      // Append them to the end of the vector so the loop reaches them.
+      if (!SplitVRegs.empty()) {
+        VRegsToAlloc.append(SplitVRegs.begin(), SplitVRegs.end());
       }
     }
   }

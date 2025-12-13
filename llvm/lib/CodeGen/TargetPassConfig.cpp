@@ -1489,27 +1489,26 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&MachineLoopInfoID);
   
   //------497--------//
-// ============================================================
-  // 1. SSA ALLOCATOR PIPELINE (Explicit Construction)
+  // ============================================================
+  // SSA ALLOCATOR PIPELINE
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-    // Pre RA //
+    //------------ PreRA ------------//
+    // (Skip PHI Elim, TwoAddress, Scheduler) to keep SSA
     addPass(createCriticalEdgeRemovalPass());
-    // (Skip PHI Elim, TwoAddress, Scheduler) to not break SSA
 
-    // RA //
+    //------------ RA ------------//
     // Call the factory directly to ensure RASSA is added, not Greedy.
     addPass(createSSARegisterAllocator());
 
+    //------------ PostRA ------------//
+    addPass(createSSADeconstructionPass());
 
-    // POST RA //
     // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
 
-    addPass(createSSADeconstructionPass());
-
     addPass(&StackSlotColoringID);
-    addPostRewrite(); // Target hook
+    addPostRewrite();
     addPass(&MachineCopyPropagationID);
     addPass(&MachineLICMID);
 
