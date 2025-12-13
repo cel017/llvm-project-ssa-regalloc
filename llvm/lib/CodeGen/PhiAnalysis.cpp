@@ -51,7 +51,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
       Register DefReg = MI.getOperand(0).getReg();
       if (!DefReg.isVirtual()) continue;
 
-      unsigned DefIdx = Register::virtReg2Index(DefReg);
+      unsigned DefIdx = TargetRegisterInfo::virtReg2Index(DefReg);
 
       for (unsigned i = 1, e = MI.getNumOperands(); i < e; i += 2) {
         Register UseReg = MI.getOperand(i).getReg();
@@ -59,7 +59,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
         // Only join Virtual Registers. 
         // (Physicals in PHIs are rare in SSA but can happen if pre-colored).
         if (UseReg.isVirtual()) {
-          unsigned UseIdx = Register::virtReg2Index(UseReg);
+          unsigned UseIdx = TargetRegisterInfo::virtReg2Index(UseReg);
           Classes.join(DefIdx, UseIdx);
         }
       }
@@ -76,7 +76,7 @@ bool PhiAnalysis::runOnMachineFunction(MachineFunction &MF) {
 unsigned PhiAnalysis::getClass(Register Reg) const {
   if (!Reg.isVirtual()) return 0;
   // Map VirtReg -> Index -> Leader Index
-  return Classes[Register::virtReg2Index(Reg)];
+  return Classes[TargetRegisterInfo::virtReg2Index(Reg)];
 }
 
 namespace llvm {
