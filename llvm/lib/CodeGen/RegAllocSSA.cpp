@@ -417,8 +417,8 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
-  RegAllocBase::init(&VRM, &LIS, &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-
+  RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
+  
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
