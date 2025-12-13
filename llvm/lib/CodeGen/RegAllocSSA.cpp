@@ -453,7 +453,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   MF = &mf;
 
-  // 1. Initialize RegClassInfo (Crucial!)
+  // 1. Initialize RegClassInfo (Crucial for AllocationOrder)
   RegClassInfo.runOnMachineFunction(*MF);
 
   // 2. Fetch Analyses
@@ -461,7 +461,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
 
-  // 3. Isolate PHIs (Fixes Definition Spills)
+  // 3. Isolate PHIs (Fixes "Spilling PHI Def" crashes)
   isolatePhis(*MF, LIS, VRM, SI);
 
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
@@ -469,13 +469,22 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
-  // 4. Init Base
+  // 4. Initialize Allocator Base
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
-  
-  // 5. Calculate Weights & Apply Safety Constraints
+
+  // 5. Calculate Weights & Apply STRICT Safety Constraints
+  // We must identify "Danger Blocks" (blocks with PHIs) and ensure no 
+  // live-in registers are spilled there.
+  SmallVector<MachineBasicBlock*, 8> PhiBlocks;
+  for (MachineBasicBlock &MBB : *MF) {
+    if (!MBB.empty() && MBB.front().isPHI()) {
+      PhiBlocks.push_back(&MBB);
+    }
+  }
+
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
@@ -486,31 +495,26 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     // Default Weight
     LI.setWeight((float)FSW.getWeight(Reg));
 
-    // --- SAFETY CHECK 1: PHI Definitions ---
-    // If defined by PHI, spill is fatal (store before PHI).
+    // CONSTRAINT A: Never spill a register defined by a PHI.
+    // (We handled this with isolatePhis, but this is a double-check).
     MachineInstr *DefMI = MRI.getVRegDef(Reg);
     if (DefMI && DefMI->isPHI()) {
-      LI.setWeight(1.0e20f); 
+      LI.markNotSpillable(); 
       continue;
     }
 
-    // --- SAFETY CHECK 2: Live-Ins to PHI Blocks ---
-    // If this register is live-in to a block that has PHIs, 
-    // the spiller might insert a RELOAD at the top (before PHIs).
-    // We must prevent this by making it unspillable.
-    for (const auto &Seg : LI) {
-      // Get the block where this segment starts
-      SlotIndex StartIdx = Seg.start;
-      MachineBasicBlock *MBB = LIS.getMBBFromIndex(StartIdx);
-      
-      // If the segment starts at the block boundary (Live-In)
-      if (MBB && StartIdx == LIS.getMBBStartIdx(MBB)) {
-         // And the block has PHIs...
-         if (!MBB->empty() && MBB->front().isPHI()) {
-             LI.setWeight(1.0e20f);
-             break; // Found a danger zone, stop checking
-         }
+    // CONSTRAINT B: Never spill a register that is Live-In to a PHI Block.
+    // The Spiller would insert a reload at the top (before PHIs), which is illegal.
+    bool IsUnsafe = false;
+    for (MachineBasicBlock *MBB : PhiBlocks) {
+      if (LIS.isLiveInToMBB(LI, MBB)) {
+        IsUnsafe = true;
+        break;
       }
+    }
+
+    if (IsUnsafe) {
+       LI.markNotSpillable();
     }
   }
 
