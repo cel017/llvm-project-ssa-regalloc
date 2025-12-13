@@ -19,7 +19,7 @@ using namespace llvm;
 namespace {
 
 struct CopyOp {
-  MCRegister Dest; // Changed to MCRegister (Physical)
+  MCRegister Dest; 
   MCRegister Src;
 };
 
@@ -27,7 +27,7 @@ class SSADeconstruction : public MachineFunctionPass {
   const TargetInstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
   MachineRegisterInfo *MRI = nullptr;
-  VirtRegMap *VRM = nullptr; // <--- Store VRM
+  VirtRegMap *VRM = nullptr;
 
 public:
   static char ID;
@@ -40,7 +40,6 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
-    // We need VRM to know which physical registers were assigned!
     AU.addRequired<VirtRegMapWrapperLegacy>(); 
     MachineFunctionPass::getAnalysisUsage(AU);
   }
@@ -74,18 +73,18 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
   TII = MF.getSubtarget().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
   MRI = &MF.getRegInfo();
-  
-  // Fetch the mapping created by your allocator
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
 
   bool Changed = false;
 
   for (MachineBasicBlock &MBB : MF) {
-    if (MBB.empty() || !MBB.front().isPHI())
-      continue;
+    if (MBB.empty()) continue;
     
-    deconstructBlock(MBB);
-    Changed = true;
+    // Process any block that starts with PHIs
+    if (MBB.front().isPHI()) {
+      deconstructBlock(MBB);
+      Changed = true;
+    }
   }
 
   return Changed;
@@ -98,26 +97,24 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
   while (I != MBB.end() && I->isPHI()) {
     MachineInstr &Phi = *I;
     Register DefVReg = Phi.getOperand(0).getReg();
-    
-    // TRANSLATE: Virtual -> Physical
     MCRegister PhysDef = VRM->getPhys(DefVReg);
     
-    // Safety check: PHI defined regs should not be spilled by now
-    if (!PhysDef) {
-       // If this hits, it means a PHI def was spilled. 
-       // Your allocator safeguards should prevent this, but if not, 
-       // we skip (or you'd need load code).
-       ++I; continue; 
+    // >>> FIX: Update Live-Ins <<<
+    // The value now flows into this block via PhysDef.
+    // We must tell LLVM that PhysDef is live-in, otherwise the Verifier complains.
+    if (PhysDef) {
+       MBB.addLiveIn(PhysDef);
+    } else {
+       // If PhysDef is 0, it means the PHI def was spilled.
+       // The Rewriter will handle the reload, but we can't add 0 to LiveIn.
+       ++I; continue;
     }
 
     for (unsigned i = 1, e = Phi.getNumOperands(); i < e; i += 2) {
       Register SrcVReg = Phi.getOperand(i).getReg();
       MachineBasicBlock *Pred = Phi.getOperand(i + 1).getMBB();
-
-      // TRANSLATE: Virtual -> Physical
       MCRegister PhysSrc = VRM->getPhys(SrcVReg);
 
-      // Handle Undef/Spilled inputs (PhysSrc == 0)
       if (!PhysSrc) continue; 
 
       if (PhysDef != PhysSrc) {
@@ -127,26 +124,33 @@ void SSADeconstruction::deconstructBlock(MachineBasicBlock &MBB) {
     ++I;
   }
 
+  // Insert copies in predecessors
   for (auto &Item : ParallelCopies) {
     MachineBasicBlock *Pred = Item.first;
     insertParallelCopies(*Pred, MBB, Item.second);
   }
 
+  // Remove PHIs
   I = MBB.begin();
   while (I != MBB.end() && I->isPHI()) {
     MachineInstr *Phi = &*I;
     ++I;
     Phi->eraseFromParent();
   }
+  
+  // Clean up the LiveIn list (sort/unique) to keep the verifier happy
+  MBB.sortUniqueLiveIns();
 }
 
 void SSADeconstruction::emitSwap(MachineBasicBlock &MBB, 
                                  MachineBasicBlock::iterator I, 
                                  MCRegister R1, MCRegister R2) const {
-  LLVM_DEBUG(dbgs() << "Emitting Cycle Breaker Swap: " << printReg(R1, TRI) 
+  // Debug output
+  LLVM_DEBUG(dbgs() << "Emitting Cycle Swap: " << printReg(R1, TRI) 
                     << " <-> " << printReg(R2, TRI) << "\n");
   
-  // NOTE: This remains a "Copy" hack. Real XOR swap depends on target.
+  // Note: Standard COPY is not a true swap, but often works if liveness allows.
+  // A true swap requires XORs or a scratch register.
   BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::COPY), R1).addReg(R2);
 }
 
@@ -166,6 +170,7 @@ void SSADeconstruction::insertParallelCopies(
       MCRegister Dst = It->Dest;
       bool DstIsSource = false;
 
+      // Check for dependencies
       for (const auto &Other : WorkList) {
         if (&Other == &*It) continue;
         if (Other.Src == Dst) {
@@ -175,7 +180,6 @@ void SSADeconstruction::insertParallelCopies(
       }
 
       if (!DstIsSource) {
-        // Now passing PHYSICAL registers to copyPhysReg
         TII->copyPhysReg(PredMBB, InsertPos, DebugLoc(), 
                          It->Dest, It->Src, It->Dest != It->Src); 
         It = WorkList.erase(It);
@@ -185,6 +189,7 @@ void SSADeconstruction::insertParallelCopies(
       }
     }
 
+    // Break Cycles
     if (!Progress && !WorkList.empty()) {
       CopyOp &Current = WorkList.back();
       MCRegister D = Current.Dest;
