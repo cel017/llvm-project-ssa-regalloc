@@ -423,15 +423,23 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
-  MachineRegisterInfo &MRI = MF->getRegInfo();
+MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
+  
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
       continue;
     
     LiveInterval &LI = LIS.getInterval(Reg);
-    LI.setWeight((float)FSW.getWeight(Reg));
+    
+    MachineInstr *DefMI = MRI.getVRegDef(Reg);
+    bool IsPhiDef = DefMI && DefMI->isPHI();
+    if (IsPhiDef) {
+      LI.setWeight(1.0e20f); // Huge weight
+    } else {
+      LI.setWeight((float)FSW.getWeight(Reg));
+    }
   }
 
   VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI,
