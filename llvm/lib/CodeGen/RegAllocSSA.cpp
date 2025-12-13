@@ -210,6 +210,10 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LiveIntervalsWrapperPass>();
   AU.addPreserved<LiveIntervalsWrapperPass>();
   AU.addPreserved<SlotIndexesWrapperPass>();
+  
+  AU.addRequired<SlotIndexesWrapperPass>(); 
+  AU.addPreserved<SlotIndexesWrapperPass>();
+  
   AU.addRequired<LiveDebugVariablesWrapperLegacy>();
   AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
   AU.addRequired<LiveStacksWrapperLegacy>();
