@@ -473,12 +473,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     for (const auto &LI : MBB.liveins()) {
       if (LI.PhysReg.isPhysical()) {
         // Case 1: Already Physical. Keep it.
-        NewLiveIns.push_back({LI.PhysReg.asMCReg(), LI.LaneMask});
+        // FIX: Remove .asMCReg(), use LI.PhysReg directly
+        NewLiveIns.push_back({LI.PhysReg, LI.LaneMask});
       } 
       else {
         // Case 2: Virtual.
-        // If it's allocated, we translate it to Physical NOW.
-        // If it's unmapped (spill/zombie), we drop it.
         if (VRM.hasPhys(LI.PhysReg)) {
            MCRegister Phys = VRM.getPhys(LI.PhysReg);
            NewLiveIns.push_back({Phys, LI.LaneMask});
@@ -487,7 +486,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     }
 
     // Replace the list with our fully physical list.
-    // The VirtRegRewriter will see only physical registers and skip them, avoiding the crash.
     MBB.clearLiveIns();
     for (const auto &Pair : NewLiveIns) {
       MBB.addLiveIn(Pair.first, Pair.second);
