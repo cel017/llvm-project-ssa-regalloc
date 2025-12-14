@@ -460,9 +460,41 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset(
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
+  // 1. Run Allocation
   allocatePhysRegs();
   
+  // 2. Post-Optimization (Standard LLVM hook)
   postOptimization();
+
+  //  Cleanup Spilled Registers from Live-Ins 
+  // The Spiller removes instructions, but stale Virtual Registers might remain 
+  // in the MBB.liveins() list. We must remove them to prevent the Rewriter from crashing.
+  for (MachineBasicBlock &MBB : *MF) {
+    // We cannot modify the list while iterating, so we collect valid ones first.
+    SmallVector<MachineBasicBlock::RegisterMaskPair, 8> ValidLiveIns;
+
+    for (const auto &LI : MBB.liveins()) {
+      if (LI.PhysReg.isPhysical()) {
+        // Keep Physical Registers (added by us or previous passes)
+        ValidLiveIns.push_back(LI);
+      } else {
+        // For Virtual Registers, check if they are allocated.
+        // If VRM.getPhys() returns 0 (NoRegister), it means it was Spilled.
+        // Spilled registers are dead (replaced by reloads), so we drop them.
+        if (VRM.hasPhys(LI.PhysReg)) {
+           ValidLiveIns.push_back(LI);
+        }
+      }
+    }
+
+    // Replace the dirty list with the clean one
+    MBB.clearLiveIns();
+    for (const auto &LI : ValidLiveIns) {
+      MBB.addLiveIn(LI.PhysReg, LI.LaneMask);
+    }
+    MBB.sortUniqueLiveIns();
+  }
+
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
   return true;
