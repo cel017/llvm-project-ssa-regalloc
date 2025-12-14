@@ -12,10 +12,8 @@ TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
-# New config: increase pressure
-# "-mattr=+e" enables the RISC-V Embedded extension.
-# This reduces the available GPRs from 32 down to 16, forcing high pressure.
-LLC_MATTR = "-mattr=+e" 
+# REMOVED: No longer forcing embedded extension (16 regs)
+LLC_MATTR = "" 
 
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
@@ -104,8 +102,7 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     else:
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
     
-    # Inject the MATTR flag to increase pressure
-    # We don't need -stats anymore since we are parsing the ASM directly
+    # We leave LLC_MATTR empty now, unless you add something back to config
     cmd = f"{cmd} {LLC_MATTR} -o {TEMP_ASM}"
     
     try:
@@ -137,7 +134,7 @@ def main():
             break
     files = files[start_index:] + files[:start_index]
 
-    print(f"Processing {len(files)} files with high pressure ({LLC_MATTR})...")
+    print(f"Processing {len(files)} files...")
     
     valid_count = 0
     skipped_count = 0
@@ -161,35 +158,41 @@ def main():
             valid, run_line = parse_requirements(fpath)
             if not valid or not run_line:
                 skipped_count += 1
+                print(f"Skipped: {fname} (Invalid Requirements or Missing RUN line)")
                 continue
                 
             clean_cmd = extract_clean_command(run_line, fpath)
             if not clean_cmd:
                 skipped_count += 1
+                print(f"Skipped: {fname} (Could not extract valid LLC command)")
                 continue
                 
             # 1. Basic
             b_stores, b_loads = run_benchmark(fpath, clean_cmd, "basic")
             if b_stores is None:
                 skipped_count += 1
+                print(f"Skipped: {fname} (Basic Allocator Failed/Timeout)")
                 continue 
             
             # 2. Greedy
             g_stores, g_loads = run_benchmark(fpath, clean_cmd, "greedy")
             if g_stores is None:
                 skipped_count += 1
+                print(f"Skipped: {fname} (Greedy Allocator Failed/Timeout)")
                 continue 
             
             # 3. SSA
             ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "ssa")
             if ssa_stores is None:
                 skipped_count += 1
+                print(f"Skipped: {fname} (SSA Allocator Failed/Timeout)")
                 continue
 
             # Filter trivial files (if all have 0 stores and 0 loads, probably uninteresting)
             if b_stores == 0 and g_stores == 0 and ssa_stores == 0 and \
                b_loads == 0 and g_loads == 0 and ssa_loads == 0:
                 skipped_count += 1
+                print(f"Skipped: {fname} (Trivial: 0 Stores/Loads across all allocators)")
                 continue
                 
             # Print status to console
