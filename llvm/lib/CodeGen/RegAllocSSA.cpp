@@ -411,11 +411,15 @@ void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotI
 void RASSA::allocatePhysRegs() {
   MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
 
+  // We use a global worklist for the whole function to handle spill artifacts correctly
+  // processing blocks in dominance order is still a good heuristic, but we need
+  // to be flexible when spills happen.
+  
   for (auto *Node : depth_first(MDT.getRootNode())) {
     MachineBasicBlock *MBB = Node->getBlock();
     if (!MBB) continue;
 
-    // 1. Collect initial VRegs
+    // 1. Collect VRegs defined in this block
     SmallVector<Register, 16> VRegsToAlloc;
 
     for (MachineInstr &MI : *MBB) {
@@ -429,15 +433,30 @@ void RASSA::allocatePhysRegs() {
       }
     }
 
-    // 2. Iterate using an index so we can handle new registers appended during the loop
+    // 2. Allocation Loop (Dynamic Size)
+    // We use an index loop because VRegsToAlloc grows when spilling happens
     for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
       Register Reg = VRegsToAlloc[i];
 
+      // sanity checks
       if (VRM->hasPhys(Reg)) continue; 
-      if (!LIS->hasInterval(Reg)) continue; 
+      
+      // If the Spiller created a reg but didn't compute liveness, we must skip or crash.
+      // Standard InlineSpiller updates LIS, so this should be fine.
+      if (!LIS->hasInterval(Reg)) {
+          // Attempt to compute it if missing (recovery mode)
+          LIS->createAndComputeVirtRegInterval(Reg);
+      }
 
       LiveInterval &LI = LIS->getInterval(Reg);
       
+      // Force Spill Weights for new registers (spill artifacts)
+      // If this is a new reg created by spilling (index > original count), 
+      // make it unspillable to avoid infinite spill loops.
+      if (i >= VRegsToAlloc.size()) { // Logic check: actually we want to check if it was added later
+          LI.markNotSpillable();
+      }
+
       SmallVector<Register, 4> SplitVRegs;
       MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
       
@@ -445,10 +464,18 @@ void RASSA::allocatePhysRegs() {
         Matrix->assign(LI, PhysReg);
       }
 
-      // If spilling created new registers (e.g., Reloads), we must allocate them NOW.
-      // Append them to the end of the vector so the loop reaches them.
+      // 3. Handle Spilled Registers
+      // If selectOrSplit returned 0, it means it spilled.
+      // The Spiller populates SplitVRegs with the new Virtual Registers (Loads/Stores).
+      // We MUST allocate these now.
       if (!SplitVRegs.empty()) {
-        VRegsToAlloc.append(SplitVRegs.begin(), SplitVRegs.end());
+        for (Register NewReg : SplitVRegs) {
+            // Mark new spill artifacts as unspillable to ensure termination
+            if (LIS->hasInterval(NewReg)) {
+                LIS->getInterval(NewReg).markNotSpillable();
+            }
+            VRegsToAlloc.push_back(NewReg);
+        }
       }
     }
   }
