@@ -17,12 +17,6 @@ TARGET_COUNT = 500
 # This reduces the available GPRs from 32 down to 16, forcing high pressure.
 LLC_MATTR = "-mattr=+e" 
 
-# Regex for RISC-V registers
-REG_PATTERN = re.compile(
-    r'\b(?:[xf](?:[1-2][0-9]|3[0-1]|[0-9])|zero|ra|sp|gp|tp|t[0-6]|'
-    r's[0-1]?[0-9]|a[0-7]|ft[0-7]|fs[0-1]?[0-9]|fa[0-7])\b'
-)
-
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
         content = f.read()
@@ -68,19 +62,40 @@ def extract_clean_command(run_line, file_path):
         cmd_str = cmd_str.replace('%s', f'"{file_path}"')
     return cmd_str.strip()
 
-def count_unique_registers(asm_file):
+def count_ops(asm_file):
+    """
+    Parses the generated assembly to count Stores and Loads.
+    """
+    stores = 0
+    loads = 0
+    
     if not os.path.exists(asm_file):
-        return 0
-    unique_regs = set()
-    with open(asm_file, 'r', errors='ignore') as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith('.') or stripped.startswith('#'):
-                continue
-            matches = REG_PATTERN.findall(line)
-            for m in matches:
-                unique_regs.add(m)
-    return len(unique_regs)
+        return 0, 0
+
+    try:
+        with open(asm_file, 'r', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                # Skip labels and comments
+                if line.endswith(':') or line.startswith('.') or line.startswith('#'):
+                    continue
+                
+                parts = line.split()
+                if not parts: continue
+                opcode = parts[0]
+
+                # 1. STORES
+                if re.match(r'^(sd|fsd|sw|fsw|sh|sb)$', opcode):
+                    stores += 1
+                
+                # 2. LOADS
+                elif re.match(r'^(ld|fld|lw|flw|lh|lb)$', opcode):
+                    loads += 1
+                    
+    except Exception:
+        return 0, 0
+        
+    return stores, loads
 
 def run_benchmark(file_path, run_cmd, alloc_mode):
     # Prepare command with allocator
@@ -90,31 +105,24 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
     
     # Inject the MATTR flag to increase pressure
-    cmd = f"{cmd} {LLC_MATTR} -stats -o {TEMP_ASM}"
+    # We don't need -stats anymore since we are parsing the ASM directly
+    cmd = f"{cmd} {LLC_MATTR} -o {TEMP_ASM}"
     
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             shell=True,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            timeout=5
+            timeout=5,
+            check=True
         )
-    except subprocess.TimeoutExpired:
-        return None, 0
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return None, None
 
-    stderr_output = result.stderr.decode('utf-8', errors='ignore')
-
-    if result.returncode != 0:
-        return None, 0
-
-    # Parse generic spill stats
-    spill_match = re.search(r'(\d+)\s+.*- Number of spills inserted', stderr_output)
-    spills = int(spill_match.group(1)) if spill_match else 0
-
-    # Count unique registers from the generated asm
-    regs = count_unique_registers(TEMP_ASM)
-    return spills, regs
+    # Count Ops from the generated asm
+    stores, loads = count_ops(TEMP_ASM)
+    return stores, loads
 
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
@@ -137,9 +145,9 @@ def main():
     with open(OUTPUT_CSV, 'w', newline='') as csvfile:
         fieldnames = [
             'filename',
-            'basic_spills', 'basic_regs',
-            'greedy_spills', 'greedy_regs',
-            'ssa_spills', 'ssa_regs'
+            'basic_stores', 'basic_loads',
+            'greedy_stores', 'greedy_loads',
+            'ssa_stores', 'ssa_loads'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -148,11 +156,7 @@ def main():
             if valid_count >= TARGET_COUNT:
                 break
 
-            sys.stdout.write(
-                f"\r[Collected: {valid_count} | Skipped: {skipped_count}] "
-                f"{os.path.basename(fpath)}...    "
-            )
-            sys.stdout.flush()
+            fname = os.path.basename(fpath)
             
             valid, run_line = parse_requirements(fpath)
             if not valid or not run_line:
@@ -165,33 +169,43 @@ def main():
                 continue
                 
             # 1. Basic
-            b_spill, b_reg = run_benchmark(fpath, clean_cmd, "basic")
-            if b_reg is None:
+            b_stores, b_loads = run_benchmark(fpath, clean_cmd, "basic")
+            if b_stores is None:
                 skipped_count += 1
                 continue 
             
             # 2. Greedy
-            g_spill, g_reg = run_benchmark(fpath, clean_cmd, "greedy")
-            if g_reg is None:
+            g_stores, g_loads = run_benchmark(fpath, clean_cmd, "greedy")
+            if g_stores is None:
                 skipped_count += 1
                 continue 
             
-            # 3. SSA computed exactly like basic and greedy
-            ssa_spill, ssa_regs = run_benchmark(fpath, clean_cmd, "ssa")
-            
-            # Filter trivial files
-            if b_reg == 0 and g_reg == 0:
+            # 3. SSA
+            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "ssa")
+            if ssa_stores is None:
+                skipped_count += 1
+                continue
+
+            # Filter trivial files (if all have 0 stores and 0 loads, probably uninteresting)
+            if b_stores == 0 and g_stores == 0 and ssa_stores == 0 and \
+               b_loads == 0 and g_loads == 0 and ssa_loads == 0:
                 skipped_count += 1
                 continue
                 
+            # Print status to console
+            print(f"[{valid_count+1}] {fname} | "
+                  f"Basic(S:{b_stores} L:{b_loads}) "
+                  f"Greedy(S:{g_stores} L:{g_loads}) "
+                  f"SSA(S:{ssa_stores} L:{ssa_loads})")
+
             writer.writerow({
-                'filename': os.path.basename(fpath),
-                'basic_spills': b_spill,
-                'basic_regs': b_reg,
-                'greedy_spills': g_spill,
-                'greedy_regs': g_reg,
-                'ssa_spills': ssa_spill,
-                'ssa_regs': ssa_regs
+                'filename': fname,
+                'basic_stores': b_stores,
+                'basic_loads': b_loads,
+                'greedy_stores': g_stores,
+                'greedy_loads': g_loads,
+                'ssa_stores': ssa_stores,
+                'ssa_loads': ssa_loads
             })
             csvfile.flush()
             valid_count += 1
