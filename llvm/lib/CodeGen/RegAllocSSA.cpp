@@ -451,15 +451,15 @@ void RASSA::allocatePhysRegs() {
       MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
       
       if (PhysReg) {
-        // Step 1: Mark as busy in Matrix
-        Matrix->assign(LI, PhysReg);
-        
-        // >>> CRITICAL FIX: Record the assignment for the Rewriter <<<
-        VRM->assignVirt2Phys(Reg, PhysReg);
+        // Matrix->assign AUTOMATICALLY updates VRM->assignVirt2Phys
+        Matrix->assign(LI, PhysReg); 
       }
 
       // 3. Handle Spilled Registers
       if (!SplitVRegs.empty()) {
+        // SAFETY: The map must grow to accommodate new spill registers
+        VRM->grow(); 
+        
         for (Register NewReg : SplitVRegs) {
             if (LIS->hasInterval(NewReg)) {
                 LIS->getInterval(NewReg).markNotSpillable();
