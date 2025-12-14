@@ -12,9 +12,7 @@ TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
-# --- REVERTED TO MATTR=+E ---
-# This enables the RISC-V Embedded extension.
-# It limits the register set to 16 GPRs (x0-x15).
+# --- MATTR=+E (16 Registers) ---
 LLC_MATTR = "-mattr=+e" 
 
 def parse_requirements(file_path):
@@ -108,20 +106,25 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     cmd = f"{cmd} {LLC_MATTR} -o {TEMP_ASM}"
     
     try:
-        subprocess.run(
+        # Capture stderr so we can print it on failure
+        result = subprocess.run(
             cmd,
             shell=True,
-            stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            encoding='utf-8',
+            errors='ignore',
             timeout=5,
             check=True
         )
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return None, None
+    except subprocess.TimeoutExpired:
+        return None, None, "TIMEOUT EXPIRED"
+    except subprocess.CalledProcessError as e:
+        return None, None, e.stderr # Return the actual error message
 
     # Count Ops from the generated asm
     stores, loads = count_ops(TEMP_ASM)
-    return stores, loads
+    return stores, loads, None
 
 def main():
     files = glob.glob(os.path.join(TEST_DIR, "*.ll"))
@@ -170,27 +173,31 @@ def main():
                 continue
                 
             # 1. Basic
-            b_stores, b_loads = run_benchmark(fpath, clean_cmd, "basic")
+            b_stores, b_loads, b_err = run_benchmark(fpath, clean_cmd, "basic")
             if b_stores is None:
                 skipped_count += 1
-                print(f"Skipped: {fname} (Basic Allocator Failed/Timeout)")
+                print(f"Skipped: {fname} (Basic Allocator Failed)")
                 continue 
             
             # 2. Greedy
-            g_stores, g_loads = run_benchmark(fpath, clean_cmd, "greedy")
+            g_stores, g_loads, g_err = run_benchmark(fpath, clean_cmd, "greedy")
             if g_stores is None:
                 skipped_count += 1
-                print(f"Skipped: {fname} (Greedy Allocator Failed/Timeout)")
+                print(f"Skipped: {fname} (Greedy Allocator Failed)")
                 continue 
             
             # 3. SSA
-            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "ssa")
+            ssa_stores, ssa_loads, ssa_err = run_benchmark(fpath, clean_cmd, "ssa")
             if ssa_stores is None:
                 skipped_count += 1
-                print(f"Skipped: {fname} (SSA Allocator Failed/Timeout)")
+                print(f"\n!!! Skipped: {fname} (SSA Allocator Failed) !!!")
+                print("="*40)
+                print(f"ERROR LOG FOR {fname} (SSA):")
+                print(ssa_err)
+                print("="*40 + "\n")
                 continue
 
-            # Filter trivial files (if all have 0 stores and 0 loads, probably uninteresting)
+            # Filter trivial files
             if b_stores == 0 and g_stores == 0 and ssa_stores == 0 and \
                b_loads == 0 and g_loads == 0 and ssa_loads == 0:
                 skipped_count += 1
