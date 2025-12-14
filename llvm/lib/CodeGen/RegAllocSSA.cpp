@@ -467,44 +467,38 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   postOptimization();
 
   
-  LLVM_DEBUG(dbgs() << "--- STARTING LIVE-IN CLEANUP ---\n");
   for (MachineBasicBlock &MBB : *MF) {
-    SmallVector<MachineBasicBlock::RegisterMaskPair, 8> ValidLiveIns;
-    bool Changed = false;
+    SmallVector<std::pair<MCRegister, LaneBitmask>, 8> NewLiveIns;
 
     for (const auto &LI : MBB.liveins()) {
       if (LI.PhysReg.isPhysical()) {
-        // Always keep physical registers
-        ValidLiveIns.push_back(LI);
-      } else {
-        // It is a Virtual Register
+        // Case 1: Already Physical. Keep it.
+        NewLiveIns.push_back({LI.PhysReg.asMCReg(), LI.LaneMask});
+      } 
+      else {
+        // Case 2: Virtual.
+        // If it's allocated, we translate it to Physical NOW.
+        // If it's unmapped (spill/zombie), we drop it.
         if (VRM.hasPhys(LI.PhysReg)) {
-           // It is allocated. Keep it.
-           ValidLiveIns.push_back(LI);
-        } else {
-           // It is UNMAPPED/SPILLED. Drop it.
-           Changed = true;
-           LLVM_DEBUG(dbgs() << "Removing Unmapped VReg " << LI.PhysReg.id() 
-                             << " from MBB " << MBB.getNumber() << "\n");
+           MCRegister Phys = VRM.getPhys(LI.PhysReg);
+           NewLiveIns.push_back({Phys, LI.LaneMask});
         }
       }
     }
 
-    if (Changed) {
-      MBB.clearLiveIns();
-      for (const auto &LI : ValidLiveIns) {
-        MBB.addLiveIn(LI.PhysReg, LI.LaneMask);
-      }
-      MBB.sortUniqueLiveIns();
+    // Replace the list with our fully physical list.
+    // The VirtRegRewriter will see only physical registers and skip them, avoiding the crash.
+    MBB.clearLiveIns();
+    for (const auto &Pair : NewLiveIns) {
+      MBB.addLiveIn(Pair.first, Pair.second);
     }
+    MBB.sortUniqueLiveIns();
   }
-  
-  LLVM_DEBUG(dbgs() << "--- FINISHED LIVE-IN CLEANUP ---\n");
-  
+
+  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
   return true;
 }
-
 
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 
