@@ -12,19 +12,10 @@ TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
-# --- REGISTER STARVATION (Force 5 Registers: a0-a4) ---
-# We reserve everything else so the allocator only sees a0-a4 as free.
-reserved_regs = []
-# x5-x7 (t0-t2)
-for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")   
-# x8-x9 (s0-s1)
-for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")  
-# x15-x17 (a5-a7)
-for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}") 
-# x18-x31 (s2-s11, t3-t6)
-for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}") 
-
-LLC_MATTR = f"-mattr={','.join(reserved_regs)}"
+# --- REVERTED TO MATTR=+E ---
+# This enables the RISC-V Embedded extension.
+# It limits the register set to 16 GPRs (x0-x15).
+LLC_MATTR = "-mattr=+e" 
 
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
@@ -113,7 +104,7 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     else:
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
     
-    # Inject the STARVE/RESERVE flags
+    # Inject the MATTR flag
     cmd = f"{cmd} {LLC_MATTR} -o {TEMP_ASM}"
     
     try:
@@ -145,7 +136,7 @@ def main():
             break
     files = files[start_index:] + files[:start_index]
 
-    print(f"Processing {len(files)} files with FORCE 5 REGS (a0-a4)...")
+    print(f"Processing {len(files)} files with MATTR=+E (16 Regs)...")
     
     valid_count = 0
     skipped_count = 0
