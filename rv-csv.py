@@ -5,15 +5,26 @@ import subprocess
 import sys
 import csv
 
-# Configuration
+# --- CONFIGURATION ---
 LLC_CMD = os.path.abspath("build_rv1/bin/llc")
 TEST_DIR = "497"
 TEMP_ASM = "temp_output.s"
 OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
-# REMOVED: No longer forcing embedded extension (16 regs)
-LLC_MATTR = "" 
+# --- REGISTER STARVATION (Force 5 Registers: a0-a4) ---
+# We reserve everything else so the allocator only sees a0-a4 as free.
+reserved_regs = []
+# x5-x7 (t0-t2)
+for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")   
+# x8-x9 (s0-s1)
+for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")  
+# x15-x17 (a5-a7)
+for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}") 
+# x18-x31 (s2-s11, t3-t6)
+for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}") 
+
+LLC_MATTR = f"-mattr={','.join(reserved_regs)}"
 
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
@@ -102,7 +113,7 @@ def run_benchmark(file_path, run_cmd, alloc_mode):
     else:
         cmd = f"{run_cmd} -regalloc={alloc_mode}"
     
-    # We leave LLC_MATTR empty now, unless you add something back to config
+    # Inject the STARVE/RESERVE flags
     cmd = f"{cmd} {LLC_MATTR} -o {TEMP_ASM}"
     
     try:
@@ -134,7 +145,7 @@ def main():
             break
     files = files[start_index:] + files[:start_index]
 
-    print(f"Processing {len(files)} files...")
+    print(f"Processing {len(files)} files with FORCE 5 REGS (a0-a4)...")
     
     valid_count = 0
     skipped_count = 0
@@ -182,7 +193,7 @@ def main():
                 continue 
             
             # 3. SSA
-            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "basic")
+            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "ssa")
             if ssa_stores is None:
                 skipped_count += 1
                 print(f"Skipped: {fname} (SSA Allocator Failed/Timeout)")
