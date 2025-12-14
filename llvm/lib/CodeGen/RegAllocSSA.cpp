@@ -479,9 +479,8 @@ void RASSA::allocatePhysRegs() {
     else if (SplitVRegs.empty()) {
        // Fatal Error: Could not Allocate AND Could not Spill.
        // This usually means we ran out of registers for a "pinned" (unspillable) value.
-       report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
-                          Twine(Register::virtReg2Index(Reg)));
-    }
+      report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
+                        Twine(Reg.id()));    }
 
     // --- C. Handle Spills ---
     
