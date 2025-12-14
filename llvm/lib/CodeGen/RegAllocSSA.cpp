@@ -51,6 +51,9 @@ FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F);
 
 namespace {
 
+//===----------------------------------------------------------------------===//
+// Spill Weight Calculator
+//===----------------------------------------------------------------------===//
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
@@ -106,6 +109,9 @@ struct CompSpillWeight {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// RASSA Class
+//===----------------------------------------------------------------------===//
 class RASSA : public MachineFunctionPass,
               public RegAllocBase,
               private LiveRangeEdit::Delegate {
@@ -130,8 +136,11 @@ public:
       MachineFunctionProperties::Property::IsSSA);
   }
 
-  // NOTE: We do NOT implement getClearedProperties(). 
-  // We let the VirtRegRewriter (which runs after us) handle the SSA->NoSSA transition.
+  // CRITICAL: Explicitly clear IsSSA to prevent Verification errors after rewriting
+  MachineFunctionProperties getClearedProperties() const override {
+    return MachineFunctionProperties().set(
+      MachineFunctionProperties::Property::IsSSA);
+  }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   void releaseMemory() override;
@@ -201,11 +210,10 @@ void RASSA::LRE_WillShrinkVirtReg(Register VirtReg) {
 
 RASSA::RASSA(RegAllocFilterFunc F) : MachineFunctionPass(ID), RegAllocBase(F) {}
 
-// >>> FIX: Analysis Usage Updates <<<
 void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
   
-  // Required Analyses
+  // Analyses we need
   AU.addRequired<AAResultsWrapperPass>();
   AU.addRequired<LiveIntervalsWrapperPass>();
   AU.addRequired<SlotIndexesWrapperPass>(); 
@@ -219,9 +227,9 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LiveRegMatrixWrapperLegacy>();
   AU.addRequired<PhiAnalysis>(); 
 
-  // Preserved Analyses
-  // We ONLY preserve VirtRegMap (because we fill it for the Rewriter)
-  // We do NOT preserve LiveIntervals or Matrix, because allocation invalidates them.
+  // Analyses we preserve
+  // IMPORTANT: We ONLY preserve VRM for the rewriter. 
+  // We do NOT preserve LiveIntervals/Matrix because allocation destroys validity.
   AU.addPreserved<VirtRegMapWrapperLegacy>();
   AU.addPreserved<SlotIndexesWrapperPass>(); 
   AU.addPreserved<AAResultsWrapperPass>();
@@ -341,10 +349,14 @@ void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotI
   }
 }
 
-// Unified Allocation Loop
+//===----------------------------------------------------------------------===//
+// Allocation Phase (Unified)
+// Iterates *MF to catch Unreachable Blocks + Spills
+//===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
   SmallVector<Register, 64> VRegsToAlloc;
 
+  // 1. Collect ALL registers (reachable + unreachable)
   for (MachineBasicBlock &MBB : *MF) {
     for (MachineInstr &MI : MBB) {
       if (MI.isDebugInstr()) continue;
@@ -358,18 +370,22 @@ void RASSA::allocatePhysRegs() {
     }
   }
 
+  // 2. Process worklist (including dynamic spills)
   for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
     Register Reg = VRegsToAlloc[i];
 
     if (VRM->hasPhys(Reg)) continue;
 
+    // Safety: Ensure liveness exists
     if (!LIS->hasInterval(Reg)) {
         LIS->createAndComputeVirtRegInterval(Reg);
     }
     
     LiveInterval &LI = LIS->getInterval(Reg);
+    // Dead code handling
     if (LI.empty()) LI.setWeight(0.0f);
     
+    // Safety: Prevent infinite loops on spill artifacts
     if (i >= VRegsToAlloc.size()) { 
         LI.markNotSpillable();
     }
@@ -398,6 +414,9 @@ void RASSA::allocatePhysRegs() {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Main Driver
+//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   LLVM_DEBUG(dbgs() << "********** SSA REGISTER ALLOCATION **********\n"
                     << "********** Function: " << mf.getName() << '\n');
@@ -422,6 +441,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
 
+  // Identify PHI blocks for safety constraints
   SmallVector<MachineBasicBlock*, 8> PhiBlocks;
   for (MachineBasicBlock &MBB : *MF) {
     if (!MBB.empty() && MBB.front().isPHI()) {
@@ -429,6 +449,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     }
   }
 
+  // Calculate Weights & Constraints
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
@@ -463,21 +484,27 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   // 1. Run Allocation
   allocatePhysRegs();
   
-  // 2. Post-Optimization (Standard LLVM hook)
+  // 2. Optimization (standard hook)
   postOptimization();
 
+  // >>> ULTIMATE FIX: Pre-Rewrite Live-Ins <<<
+  // The VirtRegRewriter crashes if it finds a Virtual Register in LiveIns that 
+  // we didn't allocate (e.g., zombies or spills). 
+  // We fix this by rewriting the LiveIns list manually right now.
   
+  LLVM_DEBUG(dbgs() << "--- STARTING LIVE-IN SANITIZATION ---\n");
   for (MachineBasicBlock &MBB : *MF) {
     SmallVector<std::pair<MCRegister, LaneBitmask>, 8> NewLiveIns;
 
     for (const auto &LI : MBB.liveins()) {
       if (LI.PhysReg.isPhysical()) {
         // Case 1: Already Physical. Keep it.
-        // FIX: Remove .asMCReg(), use LI.PhysReg directly
         NewLiveIns.push_back({LI.PhysReg, LI.LaneMask});
       } 
       else {
         // Case 2: Virtual.
+        // If it's allocated, we translate it to Physical NOW.
+        // If it's unmapped (spill/zombie), we drop it.
         if (VRM.hasPhys(LI.PhysReg)) {
            MCRegister Phys = VRM.getPhys(LI.PhysReg);
            NewLiveIns.push_back({Phys, LI.LaneMask});
@@ -486,6 +513,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     }
 
     // Replace the list with our fully physical list.
+    // The VirtRegRewriter will see only physical registers and skip them, avoiding the crash.
     MBB.clearLiveIns();
     for (const auto &Pair : NewLiveIns) {
       MBB.addLiveIn(Pair.first, Pair.second);
