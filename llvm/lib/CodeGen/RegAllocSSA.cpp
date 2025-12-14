@@ -433,7 +433,8 @@ void RASSA::allocatePhysRegs() {
     for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
       Register Reg = VRegsToAlloc[i];
 
-      if (VRM->hasPhys(Reg)) continue; 
+      if (VRM->hasPhys(Reg) || VRM->hasStackSlot(Reg))
+        continue;
       
       // Ensure Liveness exists (Recovery for Spill Artifacts)
       if (!LIS->hasInterval(Reg)) {
@@ -470,6 +471,30 @@ void RASSA::allocatePhysRegs() {
     }
   }
 }
+
+void RASSA::allocateAllRemainingVRegs() {
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    Register V = Register::index2VirtReg(i);
+    if (MRI->reg_nodbg_empty(V)) continue;
+
+    if (!LIS->hasInterval(V)) continue;
+    LiveInterval &LI = LIS->getInterval(V);
+    if (LI.empty()) continue;
+
+    // If it already has a phys assignment, fine.
+    if (VRM->getPhys(V)) continue;
+
+    SmallVector<Register, 4> SplitVRegs;
+    MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
+    if (PhysReg)
+      Matrix->assign(LI, PhysReg);
+
+    VRM->grow();               // safe after any spilling/splitting
+    for (Register NewV : SplitVRegs)
+      ; // they’ll get picked up by this same loop as i advances, or push them into a worklist.
+  }
+}
+
 
 //===----------------------------------------------------------------------===//
 // Main Driver
@@ -552,6 +577,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
   allocatePhysRegs();
+  allocateAllRemainingVRegs();
   
   postOptimization();
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");

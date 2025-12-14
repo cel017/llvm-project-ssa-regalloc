@@ -1495,14 +1495,14 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
     //------------ PreRA ------------//
     // (Skip PHI Elim, TwoAddress, Scheduler) to keep SSA
-    addPass(createCriticalEdgeRemovalPass());
+    //addPass(createCriticalEdgeRemovalPass());
 
     //------------ RA ------------//
     // Call the factory directly to ensure RASSA is added, not Greedy.
     addPass(createSSARegisterAllocator());
 
     //------------ PostRA ------------//
-    addPass(createSSADeconstructionPass());
+    //addPass(createSSADeconstructionPass());
 
     // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
