@@ -408,93 +408,103 @@ void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotI
 //===----------------------------------------------------------------------===//
 // Pre-Order Traversal
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Allocation Phase (Unified)
+// 1. Collects ALL registers (reachable + unreachable).
+// 2. Processes them in a queue.
+// 3. Appends new spill artifacts to the queue dynamically.
+//===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
-  MachineDominatorTree &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  // Global Worklist for the entire function
+  SmallVector<Register, 64> VRegsToAlloc;
 
-  for (auto *Node : depth_first(MDT.getRootNode())) {
-    MachineBasicBlock *MBB = Node->getBlock();
-    if (!MBB) continue;
-
-    // 1. Collect VRegs
-    SmallVector<Register, 16> VRegsToAlloc;
-
-    for (MachineInstr &MI : *MBB) {
+  // Step 1: Populate Worklist
+  // We iterate over *MF (all blocks) to ensure we find registers 
+  // even in dead/unreachable blocks.
+  for (MachineBasicBlock &MBB : *MF) {
+    for (MachineInstr &MI : MBB) {
       if (MI.isDebugInstr()) continue;
       for (MachineOperand &MO : MI.defs()) {
         if (!MO.isReg()) continue;
         Register Reg = MO.getReg();
+        // Only grab Virtual Registers that haven't been assigned yet
         if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
            VRegsToAlloc.push_back(Reg);
         }
       }
     }
+  }
 
-    // 2. Allocation Loop
-    for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
-      Register Reg = VRegsToAlloc[i];
+  // Step 2: Process Worklist (Dynamic Loop)
+  // We use an index loop so we can append new registers (spills) to the end 
+  // and keep iterating until everything is colored.
+  for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
+    Register Reg = VRegsToAlloc[i];
 
-      if (VRM->hasPhys(Reg) || VRM->hasStackSlot(Reg))
-        continue;
+    // Skip if somehow already handled (defensive)
+    if (VRM->hasPhys(Reg)) continue;
+
+    // --- A. Safety Checks ---
+    
+    // Recovery: Spill artifacts often lack intervals initially.
+    if (!LIS->hasInterval(Reg)) {
+        LIS->createAndComputeVirtRegInterval(Reg);
+    }
+    
+    LiveInterval &LI = LIS->getInterval(Reg);
+    
+    // Dead Code: If interval is empty, it needs no real allocation, 
+    // but we must mark it to satisfy the Rewriter.
+    if (LI.empty()) {
+        LI.setWeight(0.0f); // Evict immediately if needed
+    }
+    
+    // Infinite Loop Prevention:
+    // If this register was added during the loop (i.e., it's a spill artifact),
+    // mark it unspillable. We don't want to spill a reload.
+    if (i >= VRegsToAlloc.size()) { 
+        LI.markNotSpillable();
+    }
+
+    // --- B. Allocation ---
+    
+    SmallVector<Register, 4> SplitVRegs;
+    MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
+
+    if (PhysReg) {
+      // Success! Mark it in the Matrix.
+      // Note: Matrix->assign AUTOMATICALLY updates VirtRegMap.
+      Matrix->assign(LI, PhysReg);
+    } 
+    else if (SplitVRegs.empty()) {
+       // Fatal Error: Could not Allocate AND Could not Spill.
+       // This usually means we ran out of registers for a "pinned" (unspillable) value.
+       report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
+                          Twine(Register::virtReg2Index(Reg)));
+    }
+
+    // --- C. Handle Spills ---
+    
+    if (!SplitVRegs.empty()) {
+      // The Spiller created new VRegs. 
+      // We must handle them in this SAME loop to ensure they get colored.
+      VRM->grow(); 
       
-      // Ensure Liveness exists (Recovery for Spill Artifacts)
-      if (!LIS->hasInterval(Reg)) {
-          LIS->createAndComputeVirtRegInterval(Reg);
-      }
-
-      LiveInterval &LI = LIS->getInterval(Reg);
-      
-      // Mark spill artifacts as unspillable
-      if (i >= VRegsToAlloc.size()) { 
-          LI.markNotSpillable();
-      }
-
-      SmallVector<Register, 4> SplitVRegs;
-      MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
-      
-      if (PhysReg) {
-        // Matrix->assign AUTOMATICALLY updates VRM->assignVirt2Phys
-        Matrix->assign(LI, PhysReg); 
-      }
-
-      // 3. Handle Spilled Registers
-      if (!SplitVRegs.empty()) {
-        // SAFETY: The map must grow to accommodate new spill registers
-        VRM->grow(); 
-        
-        for (Register NewReg : SplitVRegs) {
-            if (LIS->hasInterval(NewReg)) {
-                LIS->getInterval(NewReg).markNotSpillable();
-            }
-            VRegsToAlloc.push_back(NewReg);
+      for (Register NewReg : SplitVRegs) {
+        // Calculate liveness immediately
+        if (!LIS->hasInterval(NewReg)) {
+           LIS->createAndComputeVirtRegInterval(NewReg);
         }
+        
+        // Mark as "Must Color" (Unspillable)
+        LIS->getInterval(NewReg).markNotSpillable();
+        
+        // Add to worklist -> Loop will continue and process these next.
+        VRegsToAlloc.push_back(NewReg);
       }
     }
   }
 }
-
-void RASSA::allocateAllRemainingVRegs() {
-  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
-    Register V = Register::index2VirtReg(i);
-    if (MRI->reg_nodbg_empty(V)) continue;
-
-    if (!LIS->hasInterval(V)) continue;
-    LiveInterval &LI = LIS->getInterval(V);
-    if (LI.empty()) continue;
-
-    // If it already has a phys assignment, fine.
-    if (VRM->getPhys(V)) continue;
-
-    SmallVector<Register, 4> SplitVRegs;
-    MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
-    if (PhysReg)
-      Matrix->assign(LI, PhysReg);
-
-    VRM->grow();               // safe after any spilling/splitting
-    for (Register NewV : SplitVRegs)
-      ; // they’ll get picked up by this same loop as i advances, or push them into a worklist.
-  }
-}
-
 
 //===----------------------------------------------------------------------===//
 // Main Driver
@@ -577,7 +587,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
   allocatePhysRegs();
-  allocateAllRemainingVRegs();
   
   postOptimization();
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
