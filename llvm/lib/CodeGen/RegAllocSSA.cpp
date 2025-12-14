@@ -200,7 +200,11 @@ public:
   bool runOnMachineFunction(MachineFunction &mf) override;
 
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties();
+    // Explicitly declare that this pass ends the SSA phase.
+    // This ensures the PassManager/Verifier knows we are transitioning to machine code,
+    // even if the Rewriter (which runs next) usually handles this.
+    return MachineFunctionProperties().set(
+      MachineFunctionProperties::Property::IsSSA);
   }
 
   bool spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
