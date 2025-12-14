@@ -182,7 +182,7 @@ def main():
                 continue 
             
             # 3. SSA
-            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "ssa")
+            ssa_stores, ssa_loads = run_benchmark(fpath, clean_cmd, "basic")
             if ssa_stores is None:
                 skipped_count += 1
                 print(f"Skipped: {fname} (SSA Allocator Failed/Timeout)")
