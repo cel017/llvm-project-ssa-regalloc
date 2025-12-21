@@ -90,13 +90,13 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   PhysRegState.clear();
 
-  // --- PASS 1: GLOBAL ASSIGNMENT (Silences the Rewriter) ---
-  // Every VReg must be mapped to either a PhysReg or a Stack Slot.
+  // --- PASS 1: MAP EVERY SINGLE VREG ---
+  // This satisfies the VirtRegRewriter and handles Entry Copies/PHIs.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(VReg)) continue;
 
-    // If it's not already mapped, try to give it a reg or force a spill.
+    // Mapping logic: assign a PhysReg if possible, else spill.
     if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
       if (MCPhysReg PReg = selectPhysReg(VReg)) {
         VRM->assignVirt2Phys(VReg, PReg);
@@ -106,8 +106,8 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     }
   }
 
-  // --- PASS 2: CHORDAL LOCAL ALLOCATION ---
-  // Now refine PhysRegState (your active pool) for each block.
+  // --- PASS 2: MANAGE LIVENESS STATE ---
+  // Now we simulate the execution to manage our PhysRegState map.
   for (auto *Node : depth_first(MDT->getRootNode())) {
     allocateBlock(Node->getBlock());
   }
@@ -121,30 +121,23 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB) {
 
     SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
 
-    // 1. Expire live ranges
+    // 1. Liberation: Remove registers from PhysRegState if their life ended.
     for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
       Register VReg = it->second;
-      if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
+      if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx)) {
         it = PhysRegState.erase(it);
-      else
+      } else {
         ++it;
+      }
     }
 
-    // Process ALL operands, not just the first def
-    for (MachineOperand &MO : MI.operands()) {
-      if (!MO.isReg() || !MO.isDef()) continue;
-      Register Reg = MO.getReg();
-      if (!Reg.isVirtual()) continue;
-      
-      // If already assigned (e.g., from a previous block/phi), skip
-      if (VRM->hasPhys(Reg) || VRM->getStackSlot(Reg) != VirtRegMap::NO_STACK_SLOT)
-        continue;
-
-      if (MCPhysReg PReg = selectPhysReg(Reg)) {
-        VRM->assignVirt2Phys(Reg, PReg);
-        PhysRegState[PReg] = Reg;
-      } else {
-        spill(Reg);
+    // 2. Occupation: Mark the registers we assigned in Pass 1 as "Busy".
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
+        Register VReg = MO.getReg();
+        if (VRM->hasPhys(VReg)) {
+          PhysRegState[VRM->getPhys(VReg)] = VReg;
+        }
       }
     }
   }
