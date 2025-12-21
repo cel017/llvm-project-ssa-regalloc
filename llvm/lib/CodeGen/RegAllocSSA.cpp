@@ -448,14 +448,16 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &LISWrapper = getAnalysis<LiveIntervalsWrapperPass>();
   auto &VRMWrapper = getAnalysis<VirtRegMapWrapperLegacy>();
   
-  // Note: RegAllocBase::init takes pointers.
   RegAllocBase::init(VRMWrapper.getVRM(), LISWrapper.getLIS(), 
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // Helper references for local use
+  // Helper references
   MachineRegisterInfo &MRI = MF->getRegInfo(); 
   VirtRegMap &VRM = VRMWrapper.getVRM();
   LiveIntervals &LIS = LISWrapper.getLIS();
+  
+  // FIX 1: Get TargetRegisterInfo (TRI)
+  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
 
   // Initialize Spiller dependencies
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
@@ -473,15 +475,17 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   
   postOptimization();
 
-  // --- FINAL SANITY CHECK (Prevents cryptic crashes) ---
+  // --- FINAL SANITY CHECK ---
   bool FoundError = false;
   
   // Check 1: Unmapped Live-Ins
   for (MachineBasicBlock &MBB : *MF) {
     for (const auto &LI : MBB.liveins()) {
+      // FIX 2: Correct printReg call: (Reg, TRI, SubReg, MRI)
       if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
            dbgs() << "CRITICAL ERROR: MBB " << MBB.getName() 
-                  << " has unmapped Live-In VReg: " << printReg(LI.PhysReg, &MRI) 
+                  << " has unmapped Live-In VReg: " 
+                  << printReg(LI.PhysReg, TRI, 0, &MRI) 
                   << ". This causes the addMBBLiveIns crash.\n";
            FoundError = true;
       }
@@ -493,9 +497,15 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg)) continue; 
 
+    // FIX 3: Correct printReg call here too
     if (!VRM.hasPhys(Reg)) {
-        dbgs() << "CRITICAL ERROR: VReg " << printReg(Reg, &MRI) 
+        dbgs() << "CRITICAL ERROR: VReg " << printReg(Reg, TRI, 0, &MRI) 
                << " is used in instructions but has NO PhysReg assigned!\n";
+        
+        // Optional: Print the instruction to see where it's used
+        for (MachineInstr &UseMI : MRI.reg_instructions(Reg)) {
+             dbgs() << "   Used in: " << UseMI;
+        }
         FoundError = true;
     }
   }
@@ -506,7 +516,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   
-  // Important: Clean up Spiller
   releaseMemory(); 
   
   return true;
