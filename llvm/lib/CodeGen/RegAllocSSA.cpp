@@ -3,15 +3,19 @@
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/SlotIndexes.h"         // Fix: Missing for SlotIndexes::ID
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/Passes.h"              // Fix: Essential for pass init
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/DepthFirstIterator.h"      // Fix: For depth_first
+#include "llvm/ADT/PostOrderIterator.h"
 #include <map>
 
 using namespace llvm;
@@ -127,7 +131,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   // Traverse the Dominator Tree in Pre-order.
   // This satisfies the Chordal Graph coloring property for SSA.
-  for (auto *Node : depth_first(MDT->getRootNode())) {
+  for (auto *Node : depth_first(MDT)) {
     allocateBlock(Node->getBlock(), SWC);
   }
 
@@ -213,7 +217,7 @@ MCPhysReg RASSA::selectPhysReg(Register VReg, SpillWeightCalculator &SWC, Machin
 }
 
 void RASSA::spill(Register VReg) {
-  if (VRM->hasStackSlot(VReg)) return;
+  if (VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT) return;
   
   // Assign a stack slot via VirtRegMap
   int Slot = VRM->assignVirt2StackSlot(VReg);
