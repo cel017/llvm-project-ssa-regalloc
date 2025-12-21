@@ -23,7 +23,7 @@ using namespace llvm;
 #define DEBUG_TYPE "regalloc"
 
 namespace {
-// --- Spill Weight Calculator ---
+
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
@@ -48,7 +48,6 @@ public:
   }
 };
 
-// --- SSA Register Allocator ---
 class RASSA : public MachineFunctionPass {
   MachineFunction *MF = nullptr;
   MachineRegisterInfo *MRI = nullptr;
@@ -87,6 +86,7 @@ private:
   void allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &SWC);
   MCPhysReg selectOrSpill(Register VReg, const SpillWeightCalculator &SWC);
 };
+
 } // end anonymous namespace
 
 char RASSA::ID = 0;
@@ -113,17 +113,20 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillWeightCalculator SWC(*MRI, *MLI);
   PhysRegState.clear();
 
-  // Single-pass greedy allocation via Dominator Tree
+  // Visit blocks in Dominator Tree order (PEO for SSA chordal graphs)
   for (auto *Node : depth_first(MDT->getRootNode())) {
     allocateBlock(Node->getBlock(), SWC);
   }
 
-  // Safety: Ensure no VReg is left unmapped (prevents Rewriter crash)
+  // GLOBAL CATCH: Ensure every virtual register is mapped to satisfy the Rewriter
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(VReg)) continue;
-    if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
-      VRM->assignVirt2StackSlot(VReg);
+    if (!VRM->hasPhys(VReg) && !VRM->hasStackSlot(VReg)) {
+      if (MCPhysReg PReg = selectOrSpill(VReg, SWC))
+        VRM->assignVirt2Phys(VReg, PReg);
+      else
+        VRM->assignVirt2StackSlot(VReg);
     }
   }
 
@@ -136,7 +139,7 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &S
 
     SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
 
-    // 1. Liberation: Free registers whose live intervals expire
+    // 1. Release registers that are no longer live
     for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
       Register VReg = it->second;
       if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
@@ -145,14 +148,14 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &S
         ++it;
     }
 
-    // 2. Allocation: Map defs
-    for (const MachineOperand &MO : MI.operands()) {
+    // 2. Allocate all definitions in this instruction
+    for (MachineOperand &MO : MI.operands()) {
       if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
         Register VReg = MO.getReg();
         
-        // Skip if already assigned (e.g. from Pass 1 or function start)
-        if (VRM->hasPhys(VReg) || VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT) {
-          if (VRM->hasPhys(VReg)) PhysRegState[VRM->getPhys(VReg)] = VReg;
+        // If already assigned (by global catch or previous block), just update state
+        if (VRM->hasPhys(VReg)) {
+          PhysRegState[VRM->getPhys(VReg)] = VReg;
           continue;
         }
 
@@ -172,7 +175,7 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
   LiveInterval &LI = LIS->getInterval(VReg);
   ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
 
-  // First Attempt: Find a free register
+  // Try to find a free register
   for (MCPhysReg PReg : Order) {
     bool Busy = false;
     for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
@@ -184,7 +187,7 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
       return PReg;
   }
 
-  // Second Attempt: Spill the occupant with the lowest weight
+  // Spill heuristic: find occupant with lowest weight
   Register BestToSpill;
   unsigned MinWeight = ~0U;
   MCPhysReg BestPReg = 0;
@@ -201,15 +204,13 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
     }
   }
 
-  // If the occupant's weight is lower than the current VReg, evict it
   if (BestToSpill && MinWeight < SWC.getWeight(VReg)) {
-    LLVM_DEBUG(dbgs() << "Evicting " << printReg(BestToSpill, TRI) << " for " << printReg(VReg, TRI) << "\n");
     VRM->assignVirt2StackSlot(BestToSpill);
     PhysRegState.erase(BestPReg);
     return BestPReg;
   }
 
-  return 0; // Spill current VReg
+  return 0;
 }
 
 static RegisterRegAlloc ssaRegAlloc("ssa", "SSA Register Allocator", 
