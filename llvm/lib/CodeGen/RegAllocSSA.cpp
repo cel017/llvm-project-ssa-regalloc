@@ -90,28 +90,24 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   PhysRegState.clear();
 
-  // --- PASS 1: GLOBAL MAPPING ---
-  // Iterate through EVERY virtual register. This silences the Rewriter crash.
+  // --- PASS 1: GLOBAL ASSIGNMENT (Silences the Rewriter) ---
+  // Every VReg must be mapped to either a PhysReg or a Stack Slot.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(VReg)) continue;
 
-    // Skip if already assigned (unlikely at this stage)
-    if (VRM->hasPhys(VReg) || VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT)
-      continue;
-
-    // Try to give it a physical register globally first
-    if (MCPhysReg PReg = selectPhysReg(VReg)) {
-      VRM->assignVirt2Phys(VReg, PReg);
-    } else {
-      // If we can't find a reg, spill it. Every VReg MUST have a home.
-      VRM->assignVirt2StackSlot(VReg);
+    // If it's not already mapped, try to give it a reg or force a spill.
+    if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
+      if (MCPhysReg PReg = selectPhysReg(VReg)) {
+        VRM->assignVirt2Phys(VReg, PReg);
+      } else {
+        VRM->assignVirt2StackSlot(VReg);
+      }
     }
   }
 
-  // --- PASS 2: LOCAL REFINEMENT (The Chordal Scan) ---
-  // Now that every VReg is mapped, you can refine PhysRegState 
-  // based on the Dominator Tree.
+  // --- PASS 2: CHORDAL LOCAL ALLOCATION ---
+  // Now refine PhysRegState (your active pool) for each block.
   for (auto *Node : depth_first(MDT->getRootNode())) {
     allocateBlock(Node->getBlock());
   }
