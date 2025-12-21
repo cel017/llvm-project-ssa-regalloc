@@ -1,259 +1,208 @@
-//===-- RegAllocBasic.cpp - Basic Register Allocator ----------------------===//
-//
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-///
-/// \file
-/// This file defines the RABasic function pass, which provides a minimal
-/// implementation of the basic register allocator.
-///
-//===----------------------------------------------------------------------===//
-
-#include "RegAllocBasic.h"
-#include "AllocationOrder.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Analysis/ProfileSummaryInfo.h"
-#include "llvm/CodeGen/CalcSpillWeights.h"
-#include "llvm/CodeGen/LiveDebugVariables.h"
 #include "llvm/CodeGen/LiveIntervals.h"
-#include "llvm/CodeGen/LiveRegMatrix.h"
-#include "llvm/CodeGen/LiveStacks.h"
-#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
+#include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <map>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "regalloc"
 
-static RegisterRegAlloc basicRegAlloc("basic", "basic register allocator",
-                                      createBasicRegisterAllocator);
+namespace {
+// Your SpillWeightCalculator integrated as a helper
+class SpillWeightCalculator {
+  const MachineRegisterInfo &MRI;
+  const MachineLoopInfo &MLI;
+  static constexpr unsigned Pow10[] = {1, 10, 100, 1000, 10000, 100000, 1000000};
 
-char RABasic::ID = 0;
+  unsigned getLoopWeight(const MachineBasicBlock *MBB) const {
+    unsigned Depth = MLI.getLoopDepth(MBB);
+    return Pow10[std::min(Depth, (unsigned)6)];
+  }
 
-char &llvm::RABasicID = RABasic::ID;
+public:
+  SpillWeightCalculator(const MachineRegisterInfo &mri, const MachineLoopInfo &mli)
+      : MRI(mri), MLI(mli) {}
 
-INITIALIZE_PASS_BEGIN(RABasic, "regallocbasic", "Basic Register Allocator",
-                      false, false)
-INITIALIZE_PASS_DEPENDENCY(LiveDebugVariablesWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
+  unsigned getWeight(Register Reg) const {
+    if (!Reg.isVirtual()) return 0;
+    unsigned W = 0;
+    for (MachineInstr &MI : MRI.reg_nodbg_instructions(Reg)) {
+      W += 1 + getLoopWeight(MI.getParent());
+    }
+    return W;
+  }
+};
+
+class RASSA : public MachineFunctionPass {
+  MachineFunction *MF = nullptr;
+  MachineRegisterInfo *MRI = nullptr;
+  const TargetRegisterInfo *TRI = nullptr;
+  VirtRegMap *VRM = nullptr;
+  LiveIntervals *LIS = nullptr;
+  MachineLoopInfo *MLI = nullptr;
+  MachineDominatorTree *MDT = nullptr;
+  RegisterClassInfo RegClassInfo;
+
+  std::map<MCPhysReg, Register> PhysRegState;
+
+public:
+  static char ID;
+  RASSA() : MachineFunctionPass(ID) {}
+
+  StringRef getPassName() const override { return "SSA Register Allocator"; }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    // Use WrapperPasses to match modern LLVM infrastructure
+    AU.addRequired<LiveIntervalsWrapperPass>();
+    AU.addRequired<SlotIndexesWrapperPass>();
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addRequired<VirtRegMapWrapperLegacy>();
+    
+    AU.addPreserved<LiveIntervalsWrapperPass>();
+    AU.addPreserved<SlotIndexesWrapperPass>();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  bool runOnMachineFunction(MachineFunction &mf) override;
+
+private:
+  void allocateBlock(MachineBasicBlock *MBB, SpillWeightCalculator &SWC);
+  MCPhysReg selectPhysReg(Register VReg, SpillWeightCalculator &SWC);
+  void spill(Register VReg);
+};
+} // end anonymous namespace
+
+char RASSA::ID = 0;
+
+// Initialize using the WrapperPass naming convention
+INITIALIZE_PASS_BEGIN(RASSA, "regallocssa", "SSA Register Allocator", false, false)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(RegisterCoalescerLegacy)
-INITIALIZE_PASS_DEPENDENCY(MachineSchedulerLegacy)
-INITIALIZE_PASS_DEPENDENCY(LiveStacksWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
-INITIALIZE_PASS_END(RABasic, "regallocbasic", "Basic Register Allocator", false,
-                    false)
+INITIALIZE_PASS_END(RASSA, "regallocssa", "SSA Register Allocator", false, false)
 
-bool RABasic::LRE_CanEraseVirtReg(Register VirtReg) {
-  LiveInterval &LI = LIS->getInterval(VirtReg);
-  if (VRM->hasPhys(VirtReg)) {
-    Matrix->unassign(LI);
-    aboutToRemoveInterval(LI);
-    return true;
+bool RASSA::runOnMachineFunction(MachineFunction &mf) {
+  MF = &mf;
+  MRI = &MF->getRegInfo();
+  TRI = MF->getSubtarget().getRegisterInfo();
+  
+  // Extract analyses from WrapperPasses
+  VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
+  LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  
+  RegClassInfo.runOnMachineFunction(*MF);
+  SpillWeightCalculator SWC(*MRI, *MLI);
+  PhysRegState.clear();
+
+  // Perform allocation in Dominator Tree Pre-order
+  for (auto *Node : depth_first(MDT->getRootNode())) {
+    allocateBlock(Node->getBlock(), SWC);
   }
-  // Unassigned virtreg is probably in the priority queue.
-  // RegAllocBase will erase it after dequeueing.
-  // Nonetheless, clear the live-range so that the debug
-  // dump will show the right state for that VirtReg.
-  LI.clear();
-  return false;
-}
 
-void RABasic::LRE_WillShrinkVirtReg(Register VirtReg) {
-  if (!VRM->hasPhys(VirtReg))
-    return;
-
-  // Register is assigned, put it back on the queue for reassignment.
-  LiveInterval &LI = LIS->getInterval(VirtReg);
-  Matrix->unassign(LI);
-  enqueue(&LI);
-}
-
-RABasic::RABasic(RegAllocFilterFunc F)
-    : MachineFunctionPass(ID), RegAllocBase(F) {}
-
-void RABasic::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesCFG();
-  AU.addRequired<AAResultsWrapperPass>();
-  AU.addPreserved<AAResultsWrapperPass>();
-  AU.addRequired<LiveIntervalsWrapperPass>();
-  AU.addPreserved<LiveIntervalsWrapperPass>();
-  AU.addPreserved<SlotIndexesWrapperPass>();
-  AU.addRequired<LiveDebugVariablesWrapperLegacy>();
-  AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
-  AU.addRequired<LiveStacksWrapperLegacy>();
-  AU.addPreserved<LiveStacksWrapperLegacy>();
-  AU.addRequired<ProfileSummaryInfoWrapperPass>();
-  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
-  AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
-  AU.addRequired<MachineDominatorTreeWrapperPass>();
-  AU.addRequiredID(MachineDominatorsID);
-  AU.addPreservedID(MachineDominatorsID);
-  AU.addRequired<MachineLoopInfoWrapperPass>();
-  AU.addPreserved<MachineLoopInfoWrapperPass>();
-  AU.addRequired<VirtRegMapWrapperLegacy>();
-  AU.addPreserved<VirtRegMapWrapperLegacy>();
-  AU.addRequired<LiveRegMatrixWrapperLegacy>();
-  AU.addPreserved<LiveRegMatrixWrapperLegacy>();
-  MachineFunctionPass::getAnalysisUsage(AU);
-}
-
-void RABasic::releaseMemory() {
-  SpillerInstance.reset();
-}
-
-
-// Spill or split all live virtual registers currently unified under PhysReg
-// that interfere with VirtReg. The newly spilled or split live intervals are
-// returned by appending them to SplitVRegs.
-bool RABasic::spillInterferences(const LiveInterval &VirtReg,
-                                 MCRegister PhysReg,
-                                 SmallVectorImpl<Register> &SplitVRegs) {
-  // Record each interference and determine if all are spillable before mutating
-  // either the union or live intervals.
-  SmallVector<const LiveInterval *, 8> Intfs;
-
-  // Collect interferences assigned to any alias of the physical register.
-  for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
-    LiveIntervalUnion::Query &Q = Matrix->query(VirtReg, Unit);
-    for (const auto *Intf : reverse(Q.interferingVRegs())) {
-      if (!Intf->isSpillable() || Intf->weight() > VirtReg.weight())
-        return false;
-      Intfs.push_back(Intf);
-    }
-  }
-  LLVM_DEBUG(dbgs() << "spilling " << printReg(PhysReg, TRI)
-                    << " interferences with " << VirtReg << "\n");
-  assert(!Intfs.empty() && "expected interference");
-
-  // Spill each interfering vreg allocated to PhysReg or an alias.
-  for (const LiveInterval *Spill : Intfs) {
-    // Skip duplicates.
-    if (!VRM->hasPhys(Spill->reg()))
-      continue;
-
-    // Deallocate the interfering vreg by removing it from the union.
-    // A LiveInterval instance may not be in a union during modification!
-    Matrix->unassign(*Spill);
-
-    // Spill the extracted interval.
-    LiveRangeEdit LRE(Spill, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
-    spiller().spill(LRE);
-  }
   return true;
 }
 
-// Driver for the register assignment and splitting heuristics.
-// Manages iteration over the LiveIntervalUnions.
-//
-// This is a minimal implementation of register assignment and splitting that
-// spills whenever we run out of registers.
-//
-// selectOrSplit can only be called once per live virtual register. We then do a
-// single interference test for each register the correct class until we find an
-// available register. So, the number of interference tests in the worst case is
-// |vregs| * |machineregs|. And since the number of interference tests is
-// minimal, there is no value in caching them outside the scope of
-// selectOrSplit().
-MCRegister RABasic::selectOrSplit(const LiveInterval &VirtReg,
-                                  SmallVectorImpl<Register> &SplitVRegs) {
-  // Populate a list of physical register spill candidates.
-  SmallVector<MCRegister, 8> PhysRegSpillCands;
+void RASSA::allocateBlock(MachineBasicBlock *MBB, SpillWeightCalculator &SWC) {
+  for (MachineInstr &MI : *MBB) {
+    if (MI.isDebugInstr()) continue;
 
-  // Check for an available register in this class.
-  auto Order =
-      AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
-  for (MCRegister PhysReg : Order) {
-    assert(PhysReg.isValid());
-    // Check for interference in PhysReg
-    switch (Matrix->checkInterference(VirtReg, PhysReg)) {
-    case LiveRegMatrix::IK_Free:
-      // PhysReg is available, allocate it.
-      return PhysReg;
+    SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
 
-    case LiveRegMatrix::IK_VirtReg:
-      // Only virtual registers in the way, we may be able to spill them.
-      PhysRegSpillCands.push_back(PhysReg);
-      continue;
+    // Check expiration of physical register assignments
+    for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
+      Register VReg = it->second;
+      if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
+        it = PhysRegState.erase(it);
+      else
+        ++it;
+    }
 
-    default:
-      // RegMask or RegUnit interference.
-      continue;
+    // Assign registers to definitions
+    for (MachineOperand &MO : MI.operands()) {
+      if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
+        Register VReg = MO.getReg();
+        if (MCPhysReg PReg = selectPhysReg(VReg, SWC)) {
+          VRM->assignVirt2Phys(VReg, PReg);
+          PhysRegState[PReg] = VReg;
+        } else {
+          spill(VReg);
+        }
+      }
+    }
+  }
+}
+
+MCPhysReg RASSA::selectPhysReg(Register VReg, SpillWeightCalculator &SWC) {
+  const TargetRegisterClass *RC = MRI->getRegClass(VReg);
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
+
+  for (MCPhysReg PReg : Order) {
+    bool Busy = false;
+    for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
+      if (PhysRegState.count(*Alias)) { Busy = true; break; }
+    }
+    if (!Busy) return PReg;
+  }
+
+  // Heuristic: Spill lowest weight current occupant
+  Register BestToSpill;
+  unsigned MinWeight = ~0U;
+  MCPhysReg BestPReg = 0;
+
+  for (MCPhysReg PReg : Order) {
+    if (PhysRegState.count(PReg)) {
+      Register Occupant = PhysRegState[PReg];
+      if (Occupant.isVirtual()) {
+        unsigned W = SWC.getWeight(Occupant);
+        if (W < MinWeight) {
+          MinWeight = W;
+          BestToSpill = Occupant;
+          BestPReg = PReg;
+        }
+      }
     }
   }
 
-  // Try to spill another interfering reg with less spill weight.
-  for (MCRegister &PhysReg : PhysRegSpillCands) {
-    if (!spillInterferences(VirtReg, PhysReg, SplitVRegs))
-      continue;
-
-    assert(!Matrix->checkInterference(VirtReg, PhysReg) &&
-           "Interference after spill.");
-    // Tell the caller to allocate to this newly freed physical register.
-    return PhysReg;
+  if (BestToSpill) {
+    spill(BestToSpill);
+    return BestPReg;
   }
-
-  // No other spill candidates were found, so spill the current VirtReg.
-  LLVM_DEBUG(dbgs() << "spilling: " << VirtReg << '\n');
-  if (!VirtReg.isSpillable())
-    return ~0u;
-  LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
-  spiller().spill(LRE);
-
-  // The live virtual register requesting allocation was spilled, so tell
-  // the caller not to allocate anything during this round.
   return 0;
 }
 
-bool RABasic::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** BASIC REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
-
-  MF = &mf;
-  auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
-  auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
-  auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-
-  RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
-                     getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
-                     getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM,
-                      getAnalysis<MachineLoopInfoWrapperPass>().getLI(), MBFI,
-                      &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
-  VRAI.calculateSpillWeightsAndHints();
-
-  SpillerInstance.reset(
-      createInlineSpiller({*LIS, LiveStks, MDT, MBFI}, *MF, *VRM, VRAI));
-
-  allocatePhysRegs();
-  postOptimization();
-
-  // Diagnostic output before rewriting
-  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << *VRM << "\n");
-
-  releaseMemory();
-  return true;
+void RASSA::spill(Register VReg) {
+  if (VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT)
+    VRM->assignVirt2StackSlot(VReg);
+  
+  for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ++it) {
+    if (it->second == VReg) {
+      PhysRegState.erase(it);
+      break;
+    }
+  }
 }
 
-FunctionPass* llvm::createBasicRegisterAllocator() {
-  return new RABasic();
-}
-
-FunctionPass *llvm::createBasicRegisterAllocator(RegAllocFilterFunc F) {
-  return new RABasic(F);
-}
+// Allow invocation via -regalloc=ssa
+static RegisterRegAlloc ssaRegAlloc("ssa", "SSA Register Allocator", 
+  []() -> FunctionPass* { return new RASSA(); });
