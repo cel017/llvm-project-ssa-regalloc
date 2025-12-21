@@ -268,6 +268,7 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   
+  // 1. Check Hints
   std::pair<Register, Register> Hint = MRI->getRegAllocationHint(VirtReg.reg());
   if (Hint.second.isPhysical()) {
       MCRegister PhysHint = Hint.second;
@@ -276,9 +277,11 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
       }
   }
 
+  // 2. Build Allocation Order
   SmallVector<MCRegister, 8> PhysRegSpillCands;
   auto Order = AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
   
+  // 3. Try to Allocate
   for (MCRegister PhysReg : Order) {
     switch (Matrix->checkInterference(VirtReg, PhysReg)) {
     case LiveRegMatrix::IK_Free:
@@ -291,19 +294,99 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
     }
   }
 
+  // 4. Try to Evict (Reverse Spilling)
+  // Note: Ensure your spillInterferences implementation adds the *evicted* // register's new vregs to SplitVRegs!
   for (MCRegister &PhysReg : PhysRegSpillCands) {
     if (!spillInterferences(VirtReg, PhysReg, SplitVRegs)) continue;
     return PhysReg;
   }
 
+  // 5. Spill the Current Register
   if (!VirtReg.isSpillable()) {
      report_fatal_error("RegAllocSSA: Unable to allocate or spill register " + 
                        Twine(VirtReg.reg().id()));
   }
 
-  LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
+  // Pass nullptr for the delegate unless RASSA implements LiveRangeEdit::Delegate
+  LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, nullptr, &DeadRemats);
   spiller().spill(LRE);
+
+  // Return 0 to indicate the current register was spilled and is now dead/gone.
   return 0; 
+}
+
+void RASSA::allocatePhysRegs() {
+  SmallVector<Register, 64> VRegsToAlloc;
+
+  // 1. Correct Initialization: Use MRI to get all virtual registers
+  // Iterating instructions is fragile and can miss registers or catch dead ones.
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    // Skip empty/unused registers
+    if (MRI->reg_nodbg_empty(Reg)) continue;
+    // Skip if already handled (e.g., if you run this pass multiple times)
+    if (VRM->hasPhys(Reg)) continue;
+    
+    VRegsToAlloc.push_back(Reg);
+  }
+
+  // 2. Process Worklist (Index loop allows processing new elements added at the end)
+  for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
+    Register Reg = VRegsToAlloc[i];
+
+    // Check if somehow already assigned (e.g. by hint or previous split)
+    if (VRM->hasPhys(Reg)) continue;
+
+    // Safety: Ensure liveness exists. InlineSpiller usually updates this, 
+    // but safety checks prevent crashes.
+    if (!LIS->hasInterval(Reg)) {
+        LIS->createAndComputeVirtRegInterval(Reg);
+    }
+    
+    LiveInterval &LI = LIS->getInterval(Reg);
+    
+    // Skip dead code (zero weight or empty)
+    if (LI.empty()) continue; 
+    
+    SmallVector<Register, 4> SplitVRegs;
+    MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
+
+    if (PhysReg) {
+      // SUCCESS: Assign the register
+      Matrix->assign(LI, PhysReg);
+    } 
+    // FAILURE (PhysReg == 0): The register was spilled. 
+    // The original 'Reg' is effectively gone (replaced by loads/stores).
+    // The new registers (loads/stores) are in SplitVRegs.
+
+    if (!SplitVRegs.empty()) {
+      // Resize VirtRegMap to accommodate new register indices
+      VRM->grow(); 
+
+      for (Register NewReg : SplitVRegs) {
+        // Ensure the new register has a LiveInterval
+        if (!LIS->hasInterval(NewReg)) {
+           LIS->createAndComputeVirtRegInterval(NewReg);
+        }
+        
+        LiveInterval &NewLI = LIS->getInterval(NewReg);
+        
+        // CRITICAL: Mark new split artifacts (reloads) as non-spillable.
+        // This gives them "infinite" weight and prevents infinite spilling loops.
+        // In a production allocator, you might recalculate proper SpillWeights here,
+        // but markNotSpillable() is the safest way to stop crashes for now.
+        NewLI.markNotSpillable();
+
+        // Add to worklist to be allocated in a future iteration
+        VRegsToAlloc.push_back(NewReg);
+      }
+    } else if (!PhysReg) {
+       // Only error if we failed to assign AND failed to spill (no new regs created)
+       // This usually means the register was dead or something internal failed.
+       // It is not necessarily a fatal error, but worth logging.
+       LLVM_DEBUG(dbgs() << "Warning: Register " << Reg << " spilled but created no new VRegs (Dead?)\n");
+    }
+  }
 }
 
 void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
@@ -523,6 +606,27 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
+
+  // 1. Sanity Check LIS vs VRM
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    unsigned Reg = Register::index2VirtReg(i);
+    if (MRI->reg_nodbg_empty(Reg)) continue; // Skip unused regs
+
+    if (VRM.hasPhys(Reg)) {
+        // This is good
+    } else {
+        // This reg has no phys assignment. 
+        // Is it still in the MIR?
+        if (!MRI->reg_empty(Reg)) {
+            dbgs() << "ERROR: VReg " << printReg(Reg) << " has no PhysReg but is still used in instructions!\n";
+        }
+        // Is it still in LiveIntervals?
+        if (LIS.hasInterval(Reg)) {
+             dbgs() << "ERROR: VReg " << printReg(Reg) << " has no PhysReg but still has a LiveInterval!\n";
+        }
+    }   
+  }
+  
   return true;
 }
 
