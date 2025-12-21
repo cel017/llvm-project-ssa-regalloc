@@ -368,11 +368,9 @@ void RASSA::allocatePhysRegs() {
   SmallVector<Register, 64> VRegsToAlloc;
 
   // 1. Initialize Worklist
-  // Note: Using MRI. (dot) assuming MRI is a reference in your class. 
-  // If it's a pointer, change to MRI->
-  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
-    if (MRI.reg_nodbg_empty(Reg)) continue; 
+    if (MRI->reg_nodbg_empty(Reg)) continue; 
     if (VRM->hasPhys(Reg)) continue;         
     VRegsToAlloc.push_back(Reg);
   }
