@@ -265,23 +265,6 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
   return true;
 }
 
-void cleanupMBBLiveIns() {
-  for (MachineBasicBlock &MBB : *MF) {
-    // Collect regs to remove first to avoid invalidating iterator
-    SmallVector<Register, 8> ToRemove;
-    
-    for (const auto &LI : MBB.liveins()) {
-      if (Register::isVirtualRegister(LI.PhysReg) && !VRM->hasPhys(LI.PhysReg)) {
-        ToRemove.push_back(LI.PhysReg);
-      }
-    }
-    
-    for (Register Reg : ToRemove) {
-      MBB.removeLiveIn(Reg);
-    }
-  }
-}
-
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   
