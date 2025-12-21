@@ -547,7 +547,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   releaseMemory();
 
   // 1. Sanity Check LIS vs VRM
-  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     unsigned Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg)) continue; // Skip unused regs
 
