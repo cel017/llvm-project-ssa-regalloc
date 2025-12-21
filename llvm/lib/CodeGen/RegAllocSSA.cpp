@@ -1,7 +1,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
-#include "llvm/CodeGen/LiveRegMatrix.h" // Required for interference checking
+#include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -17,17 +17,22 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include <map>
-#include <algorithm>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "regalloc"
 
 namespace {
+// --- Spill Weight Calculator ---
 class SpillWeightCalculator {
   const MachineRegisterInfo &MRI;
   const MachineLoopInfo &MLI;
   static constexpr unsigned Pow10[] = {1, 10, 100, 1000, 10000, 100000, 1000000};
+
+  unsigned getLoopWeight(const MachineBasicBlock *MBB) const {
+    unsigned Depth = MLI.getLoopDepth(MBB);
+    return Pow10[std::min(Depth, (unsigned)6)];
+  }
 
 public:
   SpillWeightCalculator(const MachineRegisterInfo &mri, const MachineLoopInfo &mli)
@@ -37,22 +42,22 @@ public:
     if (!Reg.isVirtual()) return 0;
     unsigned W = 0;
     for (MachineInstr &MI : MRI.reg_nodbg_instructions(Reg)) {
-      unsigned Depth = std::min(MLI.getLoopDepth(MI.getParent()), (unsigned)6);
-      W += 1 + Pow10[Depth];
+      W += 1 + getLoopWeight(MI.getParent());
     }
     return W;
   }
 };
 
+// --- SSA Register Allocator ---
 class RASSA : public MachineFunctionPass {
   MachineFunction *MF = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
   VirtRegMap *VRM = nullptr;
   LiveIntervals *LIS = nullptr;
-  LiveRegMatrix *Matrix = nullptr; // Added
-  MachineLoopInfo *MLI = nullptr;
+  LiveRegMatrix *Matrix = nullptr;
   MachineDominatorTree *MDT = nullptr;
+  MachineLoopInfo *MLI = nullptr;
   RegisterClassInfo RegClassInfo;
 
   std::map<MCPhysReg, Register> PhysRegState;
@@ -66,7 +71,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     AU.addRequired<LiveIntervalsWrapperPass>();
-    AU.addRequired<LiveRegMatrixWrapperLegacy>(); // Added
+    AU.addRequired<LiveRegMatrixWrapperLegacy>();
     AU.addRequired<SlotIndexesWrapperPass>();
     AU.addRequired<MachineDominatorTreeWrapperPass>();
     AU.addRequired<MachineLoopInfoWrapperPass>();
@@ -79,9 +84,8 @@ public:
   bool runOnMachineFunction(MachineFunction &mf) override;
 
 private:
-  void allocateBlock(MachineBasicBlock *MBB);
-  MCPhysReg selectPhysReg(Register VReg);
-  void spill(Register VReg);
+  void allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &SWC);
+  MCPhysReg selectOrSpill(Register VReg, const SpillWeightCalculator &SWC);
 };
 } // end anonymous namespace
 
@@ -101,74 +105,38 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   TRI = MF->getSubtarget().getRegisterInfo();
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
-  Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM(); // Added
-  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   RegClassInfo.runOnMachineFunction(*MF);
 
   SpillWeightCalculator SWC(*MRI, *MLI);
   PhysRegState.clear();
 
-  // PASS 1: Sorted Global Assignment
-  std::vector<Register> VRegs;
+  // Single-pass greedy allocation via Dominator Tree
+  for (auto *Node : depth_first(MDT->getRootNode())) {
+    allocateBlock(Node->getBlock(), SWC);
+  }
+
+  // Safety: Ensure no VReg is left unmapped (prevents Rewriter crash)
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
-    if (!MRI->reg_nodbg_empty(VReg)) VRegs.push_back(VReg);
-  }
-
-  // Use your SpillWeightCalculator to prioritize high-use registers
-  std::sort(VRegs.begin(), VRegs.end(), [&](Register A, Register B) {
-    return SWC.getWeight(A) > SWC.getWeight(B);
-  });
-
-  for (Register VReg : VRegs) {
+    if (MRI->reg_nodbg_empty(VReg)) continue;
     if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
-      if (MCPhysReg PReg = selectPhysReg(VReg)) {
-        VRM->assignVirt2Phys(VReg, PReg);
-      } else {
-        VRM->assignVirt2StackSlot(VReg);
-      }
+      VRM->assignVirt2StackSlot(VReg);
     }
-  }
-
-  // PASS 2: Local Refinement (Dominator Tree Pre-order)
-  for (auto *Node : depth_first(MDT->getRootNode())) {
-    allocateBlock(Node->getBlock());
   }
 
   return true;
 }
 
-MCPhysReg RASSA::selectPhysReg(Register VReg) {
-  const TargetRegisterClass *RC = MRI->getRegClass(VReg);
-  LiveInterval &LI = LIS->getInterval(VReg);
-
-  for (MCPhysReg PReg : RegClassInfo.getOrder(RC)) {
-    // Check interference with other virtual registers currently in PhysRegState
-    bool Busy = false;
-    for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
-      if (PhysRegState.count(*Alias)) {
-        Busy = true;
-        break;
-      }
-    }
-    if (Busy) continue;
-
-    // Check interference with Physical Registers/Pre-colors (IG_Builder_Fer logic)
-    // LiveRegMatrix handles checking all regunits of PReg against the interval LI.
-    if (Matrix->checkInterference(LI, PReg) != LiveRegMatrix::IK_Free)
-      continue;
-
-    return PReg;
-  }
-  return 0;
-}
-
-void RASSA::allocateBlock(MachineBasicBlock *MBB) {
+void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &SWC) {
   for (MachineInstr &MI : *MBB) {
     if (MI.isDebugInstr()) continue;
+
     SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
 
+    // 1. Liberation: Free registers whose live intervals expire
     for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
       Register VReg = it->second;
       if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
@@ -177,19 +145,71 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB) {
         ++it;
     }
 
+    // 2. Allocation: Map defs
     for (const MachineOperand &MO : MI.operands()) {
       if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
         Register VReg = MO.getReg();
-        if (VRM->hasPhys(VReg))
-          PhysRegState[VRM->getPhys(VReg)] = VReg;
+        
+        // Skip if already assigned (e.g. from Pass 1 or function start)
+        if (VRM->hasPhys(VReg) || VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT) {
+          if (VRM->hasPhys(VReg)) PhysRegState[VRM->getPhys(VReg)] = VReg;
+          continue;
+        }
+
+        if (MCPhysReg PReg = selectOrSpill(VReg, SWC)) {
+          VRM->assignVirt2Phys(VReg, PReg);
+          PhysRegState[PReg] = VReg;
+        } else {
+          VRM->assignVirt2StackSlot(VReg);
+        }
       }
     }
   }
 }
 
-void RASSA::spill(Register VReg) {
-  if (VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT)
-    VRM->assignVirt2StackSlot(VReg);
+MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) {
+  const TargetRegisterClass *RC = MRI->getRegClass(VReg);
+  LiveInterval &LI = LIS->getInterval(VReg);
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
+
+  // First Attempt: Find a free register
+  for (MCPhysReg PReg : Order) {
+    bool Busy = false;
+    for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
+      if (PhysRegState.count(*Alias)) { Busy = true; break; }
+    }
+    if (Busy) continue;
+
+    if (Matrix->checkInterference(LI, PReg) == LiveRegMatrix::IK_Free)
+      return PReg;
+  }
+
+  // Second Attempt: Spill the occupant with the lowest weight
+  Register BestToSpill;
+  unsigned MinWeight = ~0U;
+  MCPhysReg BestPReg = 0;
+
+  for (MCPhysReg PReg : Order) {
+    auto it = PhysRegState.find(PReg);
+    if (it != PhysRegState.end() && it->second.isVirtual()) {
+      unsigned W = SWC.getWeight(it->second);
+      if (W < MinWeight) {
+        MinWeight = W;
+        BestToSpill = it->second;
+        BestPReg = PReg;
+      }
+    }
+  }
+
+  // If the occupant's weight is lower than the current VReg, evict it
+  if (BestToSpill && MinWeight < SWC.getWeight(VReg)) {
+    LLVM_DEBUG(dbgs() << "Evicting " << printReg(BestToSpill, TRI) << " for " << printReg(VReg, TRI) << "\n");
+    VRM->assignVirt2StackSlot(BestToSpill);
+    PhysRegState.erase(BestPReg);
+    return BestPReg;
+  }
+
+  return 0; // Spill current VReg
 }
 
 static RegisterRegAlloc ssaRegAlloc("ssa", "SSA Register Allocator", 
