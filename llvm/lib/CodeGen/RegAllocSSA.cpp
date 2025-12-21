@@ -368,65 +368,64 @@ void RASSA::allocatePhysRegs() {
   SmallVector<Register, 64> VRegsToAlloc;
 
   // 1. Initialize Worklist
-  // Use MRI-> (pointer) because RegAllocBase usually defines it as a pointer.
-  // If your class has it as a reference, change to MRI.
-  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+  // Note: Using MRI. (dot) assuming MRI is a reference in your class. 
+  // If it's a pointer, change to MRI->
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
-    if (MRI->reg_nodbg_empty(Reg)) continue; // Skip unused
-    if (VRM->hasPhys(Reg)) continue;         // Skip already done
+    if (MRI.reg_nodbg_empty(Reg)) continue; 
+    if (VRM->hasPhys(Reg)) continue;         
     VRegsToAlloc.push_back(Reg);
   }
 
-  // 2. Process Worklist (Loop grows as spills happen)
+  // 2. Process Worklist
   for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
     Register Reg = VRegsToAlloc[i];
 
-    // Check if already assigned or cleared
     if (VRM->hasPhys(Reg)) continue;
 
-    // Safety: Ensure LIS has the interval
     if (!LIS->hasInterval(Reg)) {
         LIS->createAndComputeVirtRegInterval(Reg);
     }
     
     LiveInterval &LI = LIS->getInterval(Reg);
     
-    // Skip if empty/dead
+    // Handle dead intervals
     if (LI.empty()) {
         LIS->removeInterval(Reg);
         continue; 
     }
 
-    // Try to allocate
     SmallVector<Register, 4> SplitVRegs;
     MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
 
     if (PhysReg) {
-      // SUCCESS: Assign the register
       Matrix->assign(LI, PhysReg);
     } 
     else {
-      // SPILL HAPPENED
-      // Handling the "Unmapped Virtual Register" Crash:
+      // --- SPILL OCCURRED ---
       
       // A. Handle New Registers (Reloads)
       if (!SplitVRegs.empty()) {
-        VRM->grow(); // Resize map for new VRegs
+        VRM->grow(); 
         for (Register NewReg : SplitVRegs) {
            if (!LIS->hasInterval(NewReg)) {
                LIS->createAndComputeVirtRegInterval(NewReg);
            }
-           // Mark infinite weight to prevent infinite spilling loops
            LIS->getInterval(NewReg).markNotSpillable();
-           
-           // Add to worklist
            VRegsToAlloc.push_back(NewReg);
         }
       }
       
-      // B. Clean up the Old Register
-      // The old 'Reg' was spilled. It should no longer be live.
-      // We must remove it from LIS so VirtRegRewriter doesn't see it in LiveIns.
+      // B. CRITICAL FIX: Remove the "Zombie" Register from MBB Live-Ins
+      // The Spiller removed the instructions, but not the MBB LiveIn metadata.
+      // We must strip 'Reg' from all blocks, otherwise VirtRegRewriter asserts.
+      for (MachineBasicBlock &MBB : *MF) {
+        if (MBB.isLiveIn(Reg)) {
+          MBB.removeLiveIn(Reg);
+        }
+      }
+
+      // C. Remove from LIS
       if (LIS->hasInterval(Reg)) {
           LIS->removeInterval(Reg);
       }
@@ -438,12 +437,12 @@ void RASSA::allocatePhysRegs() {
 // Main Driver
 //===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
+  // Use dbgs() for standard debug info (hidden in release)
   LLVM_DEBUG(dbgs() << "********** SSA REGISTER ALLOCATION **********\n"
                     << "********** Function: " << mf.getName() << '\n');
 
   MF = &mf;
 
-  // Initialize standard analyses
   RegClassInfo.runOnMachineFunction(*MF);
   auto &LISWrapper = getAnalysis<LiveIntervalsWrapperPass>();
   auto &VRMWrapper = getAnalysis<VirtRegMapWrapperLegacy>();
@@ -451,15 +450,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   RegAllocBase::init(VRMWrapper.getVRM(), LISWrapper.getLIS(), 
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // Helper references
   MachineRegisterInfo &MRI = MF->getRegInfo(); 
   VirtRegMap &VRM = VRMWrapper.getVRM();
   LiveIntervals &LIS = LISWrapper.getLIS();
-  
-  // FIX 1: Get TargetRegisterInfo (TRI)
   const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
 
-  // Initialize Spiller dependencies
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
@@ -470,54 +465,41 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset(
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
-  // --- RUN ALLOCATION ---
   allocatePhysRegs();
   
   postOptimization();
 
-  // --- FINAL SANITY CHECK ---
+  // --- FINAL SANITY CHECK (VISIBLE IN RELEASE MODE) ---
   bool FoundError = false;
   
-  // Check 1: Unmapped Live-Ins
   for (MachineBasicBlock &MBB : *MF) {
     for (const auto &LI : MBB.liveins()) {
-      // FIX 2: Correct printReg call: (Reg, TRI, SubReg, MRI)
       if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
-           dbgs() << "CRITICAL ERROR: MBB " << MBB.getName() 
+           // Using errs() to ensure output appears in Release builds
+           errs() << "CRITICAL ERROR: MBB " << MBB.getName() 
                   << " has unmapped Live-In VReg: " 
-                  << printReg(LI.PhysReg, TRI, 0, &MRI) 
-                  << ". This causes the addMBBLiveIns crash.\n";
+                  << printReg(LI.PhysReg, TRI, 0, &MRI) << "\n";
            FoundError = true;
       }
     }
   }
 
-  // Check 2: Unmapped Uses
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg)) continue; 
 
-    // FIX 3: Correct printReg call here too
     if (!VRM.hasPhys(Reg)) {
-        dbgs() << "CRITICAL ERROR: VReg " << printReg(Reg, TRI, 0, &MRI) 
+        errs() << "CRITICAL ERROR: VReg " << printReg(Reg, TRI, 0, &MRI) 
                << " is used in instructions but has NO PhysReg assigned!\n";
-        
-        // Optional: Print the instruction to see where it's used
-        for (MachineInstr &UseMI : MRI.reg_instructions(Reg)) {
-             dbgs() << "   Used in: " << UseMI;
-        }
         FoundError = true;
     }
   }
 
   if (FoundError) {
-      report_fatal_error("RASSA: Register allocation failed consistency check. See log above.");
+      report_fatal_error("RASSA: Register allocation failed. See output above.");
   }
-
-  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   
   releaseMemory(); 
-  
   return true;
 }
 
