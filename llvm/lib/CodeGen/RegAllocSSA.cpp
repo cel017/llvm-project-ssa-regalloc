@@ -97,6 +97,19 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     allocateBlock(Node->getBlock());
   }
 
+  // 2. SAFETY CHECK: Map any remaining virtual registers
+  // This prevents the "Unmapped virtual register" crash
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    Register VReg = Register::index2VirtReg(i);
+    if (MRI->reg_nodbg_empty(VReg)) continue; // Skip if totally unused
+    
+    // If we haven't assigned a physical register AND no stack slot...
+    if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
+      LLVM_DEBUG(dbgs() << "Safety spilling unmapped vreg: " << printReg(VReg, TRI) << "\n");
+      spill(VReg); // Force to stack slot
+    }
+  }
+
   return true;
 }
 
@@ -115,16 +128,21 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB) {
         ++it;
     }
 
-    // 2. Assign defs
+    // Process ALL operands, not just the first def
     for (MachineOperand &MO : MI.operands()) {
-      if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
-        Register VReg = MO.getReg();
-        if (MCPhysReg PReg = selectPhysReg(VReg)) {
-          VRM->assignVirt2Phys(VReg, PReg);
-          PhysRegState[PReg] = VReg;
-        } else {
-          spill(VReg);
-        }
+      if (!MO.isReg() || !MO.isDef()) continue;
+      Register Reg = MO.getReg();
+      if (!Reg.isVirtual()) continue;
+      
+      // If already assigned (e.g., from a previous block/phi), skip
+      if (VRM->hasPhys(Reg) || VRM->getStackSlot(Reg) != VirtRegMap::NO_STACK_SLOT)
+        continue;
+
+      if (MCPhysReg PReg = selectPhysReg(Reg)) {
+        VRM->assignVirt2Phys(Reg, PReg);
+        PhysRegState[PReg] = Reg;
+      } else {
+        spill(Reg);
       }
     }
   }
