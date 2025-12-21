@@ -82,32 +82,38 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MF = &mf;
   MRI = &MF->getRegInfo();
   TRI = MF->getSubtarget().getRegisterInfo();
-  
-  // Extract the actual analysis classes from the Wrapper Passes
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-  
   RegClassInfo.runOnMachineFunction(*MF);
+
   PhysRegState.clear();
 
-  // The Chordal property: process blocks in Dominator Tree Pre-order
-  for (auto *Node : depth_first(MDT->getRootNode())) {
-    allocateBlock(Node->getBlock());
-  }
-
-  // 2. SAFETY CHECK: Map any remaining virtual registers
-  // This prevents the "Unmapped virtual register" crash
+  // --- PASS 1: GLOBAL MAPPING ---
+  // Iterate through EVERY virtual register. This silences the Rewriter crash.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
-    if (MRI->reg_nodbg_empty(VReg)) continue; // Skip if totally unused
-    
-    // If we haven't assigned a physical register AND no stack slot...
-    if (!VRM->hasPhys(VReg) && VRM->getStackSlot(VReg) == VirtRegMap::NO_STACK_SLOT) {
-      LLVM_DEBUG(dbgs() << "Safety spilling unmapped vreg: " << printReg(VReg, TRI) << "\n");
-      spill(VReg); // Force to stack slot
+    if (MRI->reg_nodbg_empty(VReg)) continue;
+
+    // Skip if already assigned (unlikely at this stage)
+    if (VRM->hasPhys(VReg) || VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT)
+      continue;
+
+    // Try to give it a physical register globally first
+    if (MCPhysReg PReg = selectPhysReg(VReg)) {
+      VRM->assignVirt2Phys(VReg, PReg);
+    } else {
+      // If we can't find a reg, spill it. Every VReg MUST have a home.
+      VRM->assignVirt2StackSlot(VReg);
     }
+  }
+
+  // --- PASS 2: LOCAL REFINEMENT (The Chordal Scan) ---
+  // Now that every VReg is mapped, you can refine PhysRegState 
+  // based on the Dominator Tree.
+  for (auto *Node : depth_first(MDT->getRootNode())) {
+    allocateBlock(Node->getBlock());
   }
 
   return true;
@@ -153,13 +159,19 @@ MCPhysReg RASSA::selectPhysReg(Register VReg) {
   ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
 
   for (MCPhysReg PReg : Order) {
-    bool Busy = false;
+    bool IsAliasBusy = false;
+    
+    // A physical register is busy if IT or ANY of its aliases are in use
     for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
-      if (PhysRegState.count(*Alias)) { Busy = true; break; }
+      if (PhysRegState.count(*Alias)) {
+        IsAliasBusy = true;
+        break;
+      }
     }
-    if (!Busy) return PReg;
+    
+    if (!IsAliasBusy) return PReg;
   }
-  return 0; // Simplified for initial compile - will need your weight logic back
+  return 0; // Out of registers
 }
 
 void RASSA::spill(Register VReg) {
