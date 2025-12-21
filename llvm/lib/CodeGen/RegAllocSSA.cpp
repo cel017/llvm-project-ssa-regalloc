@@ -113,16 +113,21 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillWeightCalculator SWC(*MRI, *MLI);
   PhysRegState.clear();
 
-  // Visit blocks in Dominator Tree order (PEO for SSA chordal graphs)
+  // 1. Local allocation pass (Dominator Tree Pre-order)
   for (auto *Node : depth_first(MDT->getRootNode())) {
     allocateBlock(Node->getBlock(), SWC);
   }
 
-  // GLOBAL CATCH: Ensure every virtual register is mapped to satisfy the Rewriter
+  // 2. Global Safety Pass: Ensure every register has a mapping
+  // This fix uses getStackSlot() to solve your compilation error
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(VReg)) continue;
-    if (!VRM->hasPhys(VReg) && !VRM->hasStackSlot(VReg)) {
+
+    bool HasMapping = VRM->hasPhys(VReg) || 
+                      (VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT);
+
+    if (!HasMapping) {
       if (MCPhysReg PReg = selectOrSpill(VReg, SWC))
         VRM->assignVirt2Phys(VReg, PReg);
       else
@@ -139,7 +144,7 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &S
 
     SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
 
-    // 1. Release registers that are no longer live
+    // Expire intervals
     for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
       Register VReg = it->second;
       if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
@@ -148,12 +153,11 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &S
         ++it;
     }
 
-    // 2. Allocate all definitions in this instruction
-    for (MachineOperand &MO : MI.operands()) {
+    // Allocate defs
+    for (const MachineOperand &MO : MI.operands()) {
       if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
         Register VReg = MO.getReg();
         
-        // If already assigned (by global catch or previous block), just update state
         if (VRM->hasPhys(VReg)) {
           PhysRegState[VRM->getPhys(VReg)] = VReg;
           continue;
@@ -175,7 +179,6 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
   LiveInterval &LI = LIS->getInterval(VReg);
   ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
 
-  // Try to find a free register
   for (MCPhysReg PReg : Order) {
     bool Busy = false;
     for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
@@ -187,7 +190,7 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
       return PReg;
   }
 
-  // Spill heuristic: find occupant with lowest weight
+  // Spill logic
   Register BestToSpill;
   unsigned MinWeight = ~0U;
   MCPhysReg BestPReg = 0;
