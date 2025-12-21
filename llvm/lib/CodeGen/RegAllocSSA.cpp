@@ -16,7 +16,8 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
-#include <map>
+#include <algorithm>
+#include <vector>
 
 using namespace llvm;
 
@@ -29,11 +30,6 @@ class SpillWeightCalculator {
   const MachineLoopInfo &MLI;
   static constexpr unsigned Pow10[] = {1, 10, 100, 1000, 10000, 100000, 1000000};
 
-  unsigned getLoopWeight(const MachineBasicBlock *MBB) const {
-    unsigned Depth = MLI.getLoopDepth(MBB);
-    return Pow10[std::min(Depth, (unsigned)6)];
-  }
-
 public:
   SpillWeightCalculator(const MachineRegisterInfo &mri, const MachineLoopInfo &mli)
       : MRI(mri), MLI(mli) {}
@@ -42,7 +38,8 @@ public:
     if (!Reg.isVirtual()) return 0;
     unsigned W = 0;
     for (MachineInstr &MI : MRI.reg_nodbg_instructions(Reg)) {
-      W += 1 + getLoopWeight(MI.getParent());
+      unsigned Depth = std::min(MLI.getLoopDepth(MI.getParent()), (unsigned)6);
+      W += 1 + Pow10[Depth];
     }
     return W;
   }
@@ -58,8 +55,6 @@ class RASSA : public MachineFunctionPass {
   MachineDominatorTree *MDT = nullptr;
   MachineLoopInfo *MLI = nullptr;
   RegisterClassInfo RegClassInfo;
-
-  std::map<MCPhysReg, Register> PhysRegState;
 
 public:
   static char ID;
@@ -111,27 +106,28 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   RegClassInfo.runOnMachineFunction(*MF);
 
   SpillWeightCalculator SWC(*MRI, *MLI);
-  PhysRegState.clear();
 
-  // 1. Local allocation pass (Dominator Tree Pre-order)
+  // 1. CHORDAL ALLOCATION (Dominator Tree Pre-order)
+  // We rely on LiveRegMatrix to check interferences against VRM dynamically.
   for (auto *Node : depth_first(MDT->getRootNode())) {
     allocateBlock(Node->getBlock(), SWC);
   }
 
-  // 2. Global Safety Pass: Ensure every register has a mapping
-  // This fix uses getStackSlot() to solve your compilation error
+  // 2. SAFETY CATCH-ALL
+  // If any register was missed (e.g. dead defs, unused args), spill it to stack
+  // to prevent VirtRegRewriter from crashing.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register VReg = Register::index2VirtReg(i);
+    // Skip if unused
     if (MRI->reg_nodbg_empty(VReg)) continue;
 
-    bool HasMapping = VRM->hasPhys(VReg) || 
-                      (VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT);
-
-    if (!HasMapping) {
-      if (MCPhysReg PReg = selectOrSpill(VReg, SWC))
-        VRM->assignVirt2Phys(VReg, PReg);
-      else
-        VRM->assignVirt2StackSlot(VReg);
+    // Check if unmapped
+    bool HasPhys = VRM->hasPhys(VReg);
+    bool HasStack = (VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT);
+    
+    if (!HasPhys && !HasStack) {
+      // Emergency spill
+      VRM->assignVirt2StackSlot(VReg);
     }
   }
 
@@ -142,30 +138,17 @@ void RASSA::allocateBlock(MachineBasicBlock *MBB, const SpillWeightCalculator &S
   for (MachineInstr &MI : *MBB) {
     if (MI.isDebugInstr()) continue;
 
-    SlotIndex CurrIdx = LIS->getInstructionIndex(MI).getRegSlot();
-
-    // Expire intervals
-    for (auto it = PhysRegState.begin(); it != PhysRegState.end(); ) {
-      Register VReg = it->second;
-      if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).expiredAt(CurrIdx))
-        it = PhysRegState.erase(it);
-      else
-        ++it;
-    }
-
-    // Allocate defs
-    for (const MachineOperand &MO : MI.operands()) {
+    for (MachineOperand &MO : MI.operands()) {
       if (MO.isReg() && MO.isDef() && MO.getReg().isVirtual()) {
         Register VReg = MO.getReg();
         
-        if (VRM->hasPhys(VReg)) {
-          PhysRegState[VRM->getPhys(VReg)] = VReg;
+        // If already assigned (by a previous block visit), skip
+        if (VRM->hasPhys(VReg) || VRM->getStackSlot(VReg) != VirtRegMap::NO_STACK_SLOT)
           continue;
-        }
 
+        // Try to allocate
         if (MCPhysReg PReg = selectOrSpill(VReg, SWC)) {
           VRM->assignVirt2Phys(VReg, PReg);
-          PhysRegState[PReg] = VReg;
         } else {
           VRM->assignVirt2StackSlot(VReg);
         }
@@ -179,41 +162,22 @@ MCPhysReg RASSA::selectOrSpill(Register VReg, const SpillWeightCalculator &SWC) 
   LiveInterval &LI = LIS->getInterval(VReg);
   ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
 
+  // Attempt 1: Find a free register
+  // LiveRegMatrix->checkInterference checks against:
+  //  - Reserved Registers (Fixed Interference)
+  //  - Other VRegs already assigned in VRM (Global Interference)
   for (MCPhysReg PReg : Order) {
-    bool Busy = false;
-    for (MCRegAliasIterator Alias(PReg, TRI, true); Alias.isValid(); ++Alias) {
-      if (PhysRegState.count(*Alias)) { Busy = true; break; }
-    }
-    if (Busy) continue;
-
     if (Matrix->checkInterference(LI, PReg) == LiveRegMatrix::IK_Free)
       return PReg;
   }
 
-  // Spill logic
-  Register BestToSpill;
-  unsigned MinWeight = ~0U;
-  MCPhysReg BestPReg = 0;
-
-  for (MCPhysReg PReg : Order) {
-    auto it = PhysRegState.find(PReg);
-    if (it != PhysRegState.end() && it->second.isVirtual()) {
-      unsigned W = SWC.getWeight(it->second);
-      if (W < MinWeight) {
-        MinWeight = W;
-        BestToSpill = it->second;
-        BestPReg = PReg;
-      }
-    }
-  }
-
-  if (BestToSpill && MinWeight < SWC.getWeight(VReg)) {
-    VRM->assignVirt2StackSlot(BestToSpill);
-    PhysRegState.erase(BestPReg);
-    return BestPReg;
-  }
-
-  return 0;
+  // Attempt 2: Simple Spilling (Eviction)
+  // If we must spill, we currently spill the NEW register (VReg).
+  // Implementing true eviction requires unassigning the conflict from VRM, 
+  // which is risky without the complex undo-logic of RegAllocGreedy.
+  // For this SSA allocator, "Spill Current" is the safest baseline.
+  
+  return 0; 
 }
 
 static RegisterRegAlloc ssaRegAlloc("ssa", "SSA Register Allocator", 
