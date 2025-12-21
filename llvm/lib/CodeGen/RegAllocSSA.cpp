@@ -311,6 +311,23 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
   return true;
 }
 
+void cleanupMBBLiveIns() {
+  for (MachineBasicBlock &MBB : *MF) {
+    // Collect regs to remove first to avoid invalidating iterator
+    SmallVector<Register, 8> ToRemove;
+    
+    for (const auto &LI : MBB.liveins()) {
+      if (Register::isVirtualRegister(LI.PhysReg) && !VRM->hasPhys(LI.PhysReg)) {
+        ToRemove.push_back(LI.PhysReg);
+      }
+    }
+    
+    for (Register Reg : ToRemove) {
+      MBB.removeLiveIn(Reg);
+    }
+  }
+}
+
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
   
@@ -342,22 +359,6 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
     }
   }
 
-  void cleanupMBBLiveIns() {
-  for (MachineBasicBlock &MBB : *MF) {
-    // Collect regs to remove first to avoid invalidating iterator
-    SmallVector<Register, 8> ToRemove;
-    
-    for (const auto &LI : MBB.liveins()) {
-      if (Register::isVirtualRegister(LI.PhysReg) && !VRM->hasPhys(LI.PhysReg)) {
-        ToRemove.push_back(LI.PhysReg);
-      }
-    }
-    
-    for (Register Reg : ToRemove) {
-      MBB.removeLiveIn(Reg);
-    }
-  }
-}
 
   // 4. Try to Evict (Reverse Spilling)
   for (MCRegister &PhysReg : PhysRegSpillCands) {
@@ -432,9 +433,9 @@ void RASSA::allocatePhysRegs() {
 
   // 1. Initialize Worklist
   // Note: Using MRI. (dot) assuming MRI is a reference in your class.
-  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
-    if (MRI.reg_nodbg_empty(Reg)) continue; 
+    if (MRI->reg_nodbg_empty(Reg)) continue; 
     if (VRM->hasPhys(Reg)) continue;         
     VRegsToAlloc.push_back(Reg);
   }
