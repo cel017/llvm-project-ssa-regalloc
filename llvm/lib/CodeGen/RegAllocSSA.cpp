@@ -36,9 +36,7 @@
 #include "llvm/ADT/DepthFirstIterator.h" 
 #include <queue>
 
-#include "llvm/CodeGen/PhiAnalysis.h" 
 #include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 
@@ -50,6 +48,34 @@ FunctionPass *llvm::createSSARegisterAllocator();
 FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F);
 
 namespace {
+
+// Helper: Sorts PHIs to the top of the block.
+static void fixupPHIs(MachineBasicBlock &MBB) {
+  if (MBB.empty()) return;
+  auto FirstNonPHI = MBB.getFirstNonPHI();
+  if (FirstNonPHI == MBB.end()) return;
+
+  for (auto I = FirstNonPHI, E = MBB.end(); I != E; ) {
+    MachineInstr &MI = *I;
+    ++I; 
+    if (MI.isPHI()) {
+      MBB.splice(FirstNonPHI, &MBB, MI);
+    }
+  }
+}
+
+// Helper: Removes unmapped Virtual Registers from Live-Ins.
+static void cleanupMBBLiveIns(MachineFunction &MF, VirtRegMap &VRM) {
+  for (MachineBasicBlock &MBB : MF) {
+    SmallVector<Register, 8> ToRemove;
+    for (const auto &LI : MBB.liveins()) {
+      if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg))
+        ToRemove.push_back(LI.PhysReg);
+    }
+    for (Register Reg : ToRemove)
+      MBB.removeLiveIn(Reg);
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Spill Weight Calculator
@@ -109,9 +135,6 @@ struct CompSpillWeight {
   }
 };
 
-//===----------------------------------------------------------------------===//
-// RASSA Class
-//===----------------------------------------------------------------------===//
 class RASSA : public MachineFunctionPass,
               public RegAllocBase,
               private LiveRangeEdit::Delegate {
@@ -126,27 +149,20 @@ class RASSA : public MachineFunctionPass,
 
 public:
   static char ID;
-
   RASSA(const RegAllocFilterFunc F = nullptr);
-
   StringRef getPassName() const override { return "SSA Register Allocator"; }
 
   MachineFunctionProperties getRequiredProperties() const override {
-    return MachineFunctionProperties().set(
-      MachineFunctionProperties::Property::IsSSA);
+    return MachineFunctionProperties().set(MachineFunctionProperties::Property::IsSSA);
   }
 
-  // CRITICAL: Explicitly clear IsSSA to prevent Verification errors after rewriting
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties().set(
-      MachineFunctionProperties::Property::IsSSA);
+    return MachineFunctionProperties().set(MachineFunctionProperties::Property::IsSSA);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   void releaseMemory() override;
-
   Spiller &spiller() override { return *SpillerInstance; }
-
   void enqueueImpl(const LiveInterval *LI) override { Queue.push(LI); }
 
   const LiveInterval *dequeue() override {
@@ -160,34 +176,25 @@ public:
                            SmallVectorImpl<Register> &SplitVRegs) override;
 
   void allocatePhysRegs();
-
   bool runOnMachineFunction(MachineFunction &mf) override;
-
   bool spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
                           SmallVectorImpl<Register> &SplitVRegs);
 };
 
 char RASSA::ID = 0;
+} 
 
-} // end anonymous namespace
-
-static RegisterRegAlloc ssaRegAlloc("ssa", "SSA register allocator",
-                                    createSSARegisterAllocator);
+static RegisterRegAlloc ssaRegAlloc("ssa", "SSA register allocator", createSSARegisterAllocator);
 
 INITIALIZE_PASS_BEGIN(RASSA, "regallocssa", "SSA Register Allocator", false, false)
 INITIALIZE_PASS_DEPENDENCY(LiveDebugVariablesWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(RegisterCoalescerLegacy)
-INITIALIZE_PASS_DEPENDENCY(MachineSchedulerLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveStacksWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(PhiAnalysis) 
 INITIALIZE_PASS_END(RASSA, "regallocssa", "SSA Register Allocator", false, false)
 
 bool RASSA::LRE_CanEraseVirtReg(Register VirtReg) {
@@ -212,8 +219,6 @@ RASSA::RASSA(RegAllocFilterFunc F) : MachineFunctionPass(ID), RegAllocBase(F) {}
 
 void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
-  
-  // Analyses we need
   AU.addRequired<AAResultsWrapperPass>();
   AU.addRequired<LiveIntervalsWrapperPass>();
   AU.addRequired<SlotIndexesWrapperPass>(); 
@@ -225,20 +230,14 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<MachineLoopInfoWrapperPass>();
   AU.addRequired<VirtRegMapWrapperLegacy>();
   AU.addRequired<LiveRegMatrixWrapperLegacy>();
-  AU.addRequired<PhiAnalysis>(); 
 
-  // Analyses we preserve
-  // IMPORTANT: We ONLY preserve VRM for the rewriter. 
-  // We do NOT preserve LiveIntervals/Matrix because allocation destroys validity.
   AU.addPreserved<VirtRegMapWrapperLegacy>();
   AU.addPreserved<SlotIndexesWrapperPass>(); 
-  AU.addPreserved<AAResultsWrapperPass>();
   AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
   AU.addPreserved<LiveStacksWrapperLegacy>();
   AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
   AU.addPreserved<MachineDominatorTreeWrapperPass>();
   AU.addPreserved<MachineLoopInfoWrapperPass>();
-  
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -255,7 +254,6 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
       Intfs.push_back(Intf);
     }
   }
-  assert(!Intfs.empty() && "expected interference");
   for (const LiveInterval *Spill : Intfs) {
     if (!VRM->hasPhys(Spill->reg())) continue;
     Matrix->unassign(*Spill);
@@ -267,21 +265,14 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
 
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
-  
-  // 1. Check Hints (optimisation)
   std::pair<Register, Register> Hint = MRI->getRegAllocationHint(VirtReg.reg());
   if (Hint.second.isPhysical()) {
       MCRegister PhysHint = Hint.second;
-      if (Matrix->checkInterference(VirtReg, PhysHint) == LiveRegMatrix::IK_Free) {
+      if (Matrix->checkInterference(VirtReg, PhysHint) == LiveRegMatrix::IK_Free)
           return PhysHint;
-      }
   }
 
-  // 2. Build Allocation Order
-  // Uses *VRM because RegAllocBase stores VRM as a pointer
   auto Order = AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
-  
-  // 3. Try to Allocate
   SmallVector<MCRegister, 8> PhysRegSpillCands;
 
   for (MCRegister PhysReg : Order) {
@@ -296,80 +287,22 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
     }
   }
 
-
-  // 4. Try to Evict (Reverse Spilling)
   for (MCRegister &PhysReg : PhysRegSpillCands) {
     if (!spillInterferences(VirtReg, PhysReg, SplitVRegs)) continue;
     return PhysReg;
   }
 
-  // 5. Must Spill
-  if (!VirtReg.isSpillable()) {
-     report_fatal_error("RegAllocSSA: Unable to allocate or spill register " + 
-                       Twine(VirtReg.reg().id()));
-  }
+  if (!VirtReg.isSpillable())
+     report_fatal_error("RegAllocSSA: Unable to allocate or spill register " + Twine(VirtReg.reg().id()));
 
-  // Create LiveRangeEdit. 
-  // Pass nullptr for delegate to avoid 'this' type mismatch errors.
   LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, nullptr, &DeadRemats);
   spiller().spill(LRE);
-
-  // Return 0 to indicate the register was spilled.
   return 0; 
 }
 
-void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
-  MachineRegisterInfo &MRI = MF.getRegInfo();
-  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
-
-  for (MachineBasicBlock &MBB : MF) {
-    SmallVector<MachineInstr*, 8> Phis;
-    for (MachineInstr &MI : MBB) {
-      if (!MI.isPHI()) break; 
-      Phis.push_back(&MI);
-    }
-
-    if (Phis.empty()) continue;
-
-    MachineBasicBlock::iterator InsertPos = MBB.getFirstNonPHI();
-
-    for (MachineInstr *PhiMI : Phis) {
-      Register PhiDef = PhiMI->getOperand(0).getReg();
-      if (!PhiDef.isVirtual()) continue;
-
-      const TargetRegisterClass *RC = MRI.getRegClass(PhiDef);
-      Register NewReg = MRI.createVirtualRegister(RC);
-      
-      VRM.grow(); 
-
-      MachineInstr *CopyMI = BuildMI(MBB, InsertPos, DebugLoc(), 
-                                     TII->get(TargetOpcode::COPY), NewReg)
-                                     .addReg(PhiDef);
-
-      SI.insertMachineInstrInMaps(*CopyMI);
-
-      for (MachineOperand &UseMO : llvm::make_early_inc_range(MRI.use_operands(PhiDef))) {
-        MachineInstr *UseMI = UseMO.getParent();
-        if (UseMI == CopyMI) continue;
-        UseMO.setReg(NewReg);
-      }
-
-      LIS.createAndComputeVirtRegInterval(NewReg);
-      LIS.removeInterval(PhiDef);
-      LIS.createAndComputeVirtRegInterval(PhiDef);
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Allocation Phase (Unified)
-// Iterates *MF to catch Unreachable Blocks + Spills
-//===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
   SmallVector<Register, 64> VRegsToAlloc;
 
-  // 1. Initialize Worklist
-  // Note: Using MRI. (dot) assuming MRI is a reference in your class.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg)) continue; 
@@ -377,19 +310,14 @@ void RASSA::allocatePhysRegs() {
     VRegsToAlloc.push_back(Reg);
   }
 
-  // 2. Process Worklist
   for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
     Register Reg = VRegsToAlloc[i];
-
     if (VRM->hasPhys(Reg)) continue;
 
-    // Safety check for LIS
-    if (!LIS->hasInterval(Reg)) {
+    if (!LIS->hasInterval(Reg))
         LIS->createAndComputeVirtRegInterval(Reg);
-    }
     
     LiveInterval &LI = LIS->getInterval(Reg);
-    
     if (LI.empty()) {
         LIS->removeInterval(Reg);
         continue; 
@@ -399,87 +327,32 @@ void RASSA::allocatePhysRegs() {
     MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
 
     if (PhysReg) {
-      // SUCCESS: Assign the register
       Matrix->assign(LI, PhysReg);
     } 
     else {
-      // --- SPILL OCCURRED ---
-      
-      // 1. Handle New Registers (Reloads/Spills)
+      // --- RE-LEGALIZATION AFTER SPILL ---
       if (!SplitVRegs.empty()) {
         VRM->grow(); 
         for (Register NewReg : SplitVRegs) {
-           if (!LIS->hasInterval(NewReg)) {
+           if (!LIS->hasInterval(NewReg))
                LIS->createAndComputeVirtRegInterval(NewReg);
-           }
            LIS->getInterval(NewReg).markNotSpillable();
            VRegsToAlloc.push_back(NewReg);
         }
       }
       
-      // 2. CRITICAL FIX: Always clean up the OLD register.
-      // Whether we created new regs or not, 'Reg' is dead/spilled.
-      // We must remove it from MBB LiveIns to prevent VirtRegRewriter crash.
-      for (MachineBasicBlock &MBB : *MF) {
-        if (MBB.isLiveIn(Reg)) {
-          MBB.removeLiveIn(Reg);
-        }
-      }
+      // Fix PHIs and LiveIns immediately to prevent verifier crashes in next iteration
+      for (MachineBasicBlock &MBB : *MF) fixupPHIs(MBB);
+      cleanupMBBLiveIns(*MF, *VRM);
 
-      // 3. Remove from LiveIntervals
-      if (LIS->hasInterval(Reg)) {
-          LIS->removeInterval(Reg);
-      }
+      if (LIS->hasInterval(Reg)) LIS->removeInterval(Reg);
     }
   }
 }
 
-static void fixupPHIs(MachineBasicBlock &MBB) {
-  if (MBB.empty()) return;
-
-  MachineBasicBlock::iterator InsertPos = MBB.begin();
-
-  for (auto I = MBB.begin(), E = MBB.end(); I != E; ) {
-    MachineInstr &MI = *I;
-    ++I; 
-
-    if (MI.isPHI()) {
-      if (MachineBasicBlock::iterator(MI) != InsertPos) {
-        MBB.splice(InsertPos, &MBB, MI);
-      }
-      if (InsertPos != MBB.end()) ++InsertPos;
-    } 
-  }
-}
-
-// Helper 2: Removes "Zombie" Live-Ins (Fixed arguments to avoid scope errors)
-static void cleanupMBBLiveIns(MachineFunction &MF, VirtRegMap &VRM) {
-  for (MachineBasicBlock &MBB : MF) {
-    SmallVector<Register, 8> ToRemove;
-    
-    for (const auto &LI : MBB.liveins()) {
-      // Check if it is virtual AND unmapped
-      if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
-        ToRemove.push_back(LI.PhysReg);
-      }
-    }
-    
-    for (Register Reg : ToRemove) {
-      MBB.removeLiveIn(Reg);
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Main Driver
-//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** SSA REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
-
   MF = &mf;
 
-  // 1. Initialize Analysis Passes
   RegClassInfo.runOnMachineFunction(*MF);
   auto &LISWrapper = getAnalysis<LiveIntervalsWrapperPass>();
   auto &VRMWrapper = getAnalysis<VirtRegMapWrapperLegacy>();
@@ -487,10 +360,9 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   RegAllocBase::init(VRMWrapper.getVRM(), LISWrapper.getLIS(), 
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // 2. Setup Local References
-  MachineRegisterInfo &MRI = MF->getRegInfo(); 
-  VirtRegMap &VRM = VRMWrapper.getVRM();
-  LiveIntervals &LIS = LISWrapper.getLIS();
+  MachineRegisterInfo &MRI_Ref = MF->getRegInfo(); 
+  VirtRegMap &VRM_Ref = VRMWrapper.getVRM();
+  LiveIntervals &LIS_Ref = LISWrapper.getLIS();
 
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
@@ -498,32 +370,19 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   auto &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
-  VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, &PSI);
-  SpillerInstance.reset(
-      createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
+  VirtRegAuxInfo VRAI(*MF, LIS_Ref, VRM_Ref, MLI, MBFI, &PSI);
+  SpillerInstance.reset(createInlineSpiller({LIS_Ref, LiveStks, MDT, MBFI}, *MF, VRM_Ref, VRAI));
 
-  // 3. Run Allocation
   allocatePhysRegs();
   
-  // 4. Run Cleanup (Fixes the PHI error and the Assertion)
-  
-  // Fix PHI nodes that got pushed down by the Spiller
-  for (MachineBasicBlock &MBB : *MF) {
-      fixupPHIs(MBB);
-  }
+  // Final verification and cleanup
+  for (MachineBasicBlock &MBB : *MF) fixupPHIs(MBB);
+  cleanupMBBLiveIns(*MF, VRM_Ref);
 
-  // Remove spilled registers from LiveIns
-  cleanupMBBLiveIns(*MF, VRM);
-
-  // 5. Finalize
   postOptimization();
   releaseMemory(); 
-  
   return true;
 }
 
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
-
-FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) {
-  return new RASSA(F);
-}
+FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) { return new RASSA(F); }
