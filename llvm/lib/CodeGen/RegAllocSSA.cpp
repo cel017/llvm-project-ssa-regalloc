@@ -244,52 +244,6 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
 
 void RASSA::releaseMemory() { SpillerInstance.reset(); }
 
-// Helper: Sorts PHIs to the top of the block if the Spiller messed up.
-// Helper: Sorts PHIs to the top of the block if the Spiller inserted code incorrectly.
-static void fixupPHIs(MachineBasicBlock &MBB) {
-  if (MBB.empty()) return;
-
-  MachineBasicBlock::iterator InsertPos = MBB.begin();
-
-  // Scan the block to find misplaced PHIs
-  for (auto I = MBB.begin(), E = MBB.end(); I != E; ) {
-    MachineInstr &MI = *I;
-    ++I; // Increment early because we might move MI
-
-    if (MI.isPHI()) {
-      if (MachineBasicBlock::iterator(MI) != InsertPos) {
-        // Found a PHI stuck after a non-PHI. Move it to the top.
-        MBB.splice(InsertPos, &MBB, MI);
-      }
-      // Advance the "Phi Boundary"
-      if (InsertPos != MBB.end()) ++InsertPos;
-    } 
-    // If it's not a PHI, we just continue. 
-    // If we find another PHI later, it will be moved to InsertPos (before this non-PHI).
-  }
-}
-
-// Helper: Removes unmapped Virtual Registers from Live-Ins to prevent Assertions.
-static void cleanupMBBLiveIns(MachineFunction &MF, VirtRegMap &VRM) {
-  for (MachineBasicBlock &MBB : MF) {
-    SmallVector<Register, 8> ToRemove;
-    
-    for (const auto &LI : MBB.liveins()) {
-      // If it's a virtual register AND it has no physical assignment, it's a zombie.
-      if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
-        ToRemove.push_back(LI.PhysReg);
-      }
-    }
-    
-    for (Register Reg : ToRemove) {
-      MBB.removeLiveIn(Reg);
-    }
-  }
-}
-
-  // Helper: Forcefully removes any Virtual Register from Live-Ins 
-  // that we didn't assign a physical register to.
-
 bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
                                SmallVectorImpl<Register> &SplitVRegs) {
   SmallVector<const LiveInterval *, 8> Intfs;
@@ -493,6 +447,42 @@ void RASSA::allocatePhysRegs() {
       if (LIS->hasInterval(Reg)) {
           LIS->removeInterval(Reg);
       }
+    }
+  }
+}
+
+static void fixupPHIs(MachineBasicBlock &MBB) {
+  if (MBB.empty()) return;
+
+  MachineBasicBlock::iterator InsertPos = MBB.begin();
+
+  for (auto I = MBB.begin(), E = MBB.end(); I != E; ) {
+    MachineInstr &MI = *I;
+    ++I; 
+
+    if (MI.isPHI()) {
+      if (MachineBasicBlock::iterator(MI) != InsertPos) {
+        MBB.splice(InsertPos, &MBB, MI);
+      }
+      if (InsertPos != MBB.end()) ++InsertPos;
+    } 
+  }
+}
+
+// Helper 2: Removes "Zombie" Live-Ins (Fixed arguments to avoid scope errors)
+static void cleanupMBBLiveIns(MachineFunction &MF, VirtRegMap &VRM) {
+  for (MachineBasicBlock &MBB : MF) {
+    SmallVector<Register, 8> ToRemove;
+    
+    for (const auto &LI : MBB.liveins()) {
+      // Check if it is virtual AND unmapped
+      if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
+        ToRemove.push_back(LI.PhysReg);
+      }
+    }
+    
+    for (Register Reg : ToRemove) {
+      MBB.removeLiveIn(Reg);
     }
   }
 }
