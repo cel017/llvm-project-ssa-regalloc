@@ -245,14 +245,13 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
 void RASSA::releaseMemory() { SpillerInstance.reset(); }
 
 // Helper: Sorts PHIs to the top of the block if the Spiller messed up.
-void fixupPHIs(MachineBasicBlock &MBB) {
+// Helper: Sorts PHIs to the top of the block if the Spiller inserted code incorrectly.
+static void fixupPHIs(MachineBasicBlock &MBB) {
   if (MBB.empty()) return;
 
-  // Use an iterator to track where the next PHI should go.
   MachineBasicBlock::iterator InsertPos = MBB.begin();
 
-  // Scan the whole block (or just the beginning)
-  // We move any PHI we find to the InsertPos.
+  // Scan the block to find misplaced PHIs
   for (auto I = MBB.begin(), E = MBB.end(); I != E; ) {
     MachineInstr &MI = *I;
     ++I; // Increment early because we might move MI
@@ -263,27 +262,21 @@ void fixupPHIs(MachineBasicBlock &MBB) {
         MBB.splice(InsertPos, &MBB, MI);
       }
       // Advance the "Phi Boundary"
-      ++InsertPos;
-    } else {
-      // Found a non-PHI. Do not advance InsertPos.
-      // If we see another PHI later, it will be moved BEFORE this instruction.
-      
-      // Optimization: If we have passed the "Phi Zone" and are deep in code, stop.
-      // Simple heuristic: If we see 10 non-PHIs in a row, assume we are done.
-      // (Omitting heuristic for safety, full scan of block header is cheap).
-    }
+      if (InsertPos != MBB.end()) ++InsertPos;
+    } 
+    // If it's not a PHI, we just continue. 
+    // If we find another PHI later, it will be moved to InsertPos (before this non-PHI).
   }
 }
 
-  // Helper: Forcefully removes any Virtual Register from Live-Ins 
-  // that we didn't assign a physical register to.
-void cleanupMBBLiveIns() {
-  for (MachineBasicBlock &MBB : *MF) {
-    // Collect regs to remove first to avoid invalidating iterator
+// Helper: Removes unmapped Virtual Registers from Live-Ins to prevent Assertions.
+static void cleanupMBBLiveIns(MachineFunction &MF, VirtRegMap &VRM) {
+  for (MachineBasicBlock &MBB : MF) {
     SmallVector<Register, 8> ToRemove;
     
     for (const auto &LI : MBB.liveins()) {
-      if (Register::isVirtualRegister(LI.PhysReg) && !VRM->hasPhys(LI.PhysReg)) {
+      // If it's a virtual register AND it has no physical assignment, it's a zombie.
+      if (Register::isVirtualRegister(LI.PhysReg) && !VRM.hasPhys(LI.PhysReg)) {
         ToRemove.push_back(LI.PhysReg);
       }
     }
@@ -293,6 +286,9 @@ void cleanupMBBLiveIns() {
     }
   }
 }
+
+  // Helper: Forcefully removes any Virtual Register from Live-Ins 
+  // that we didn't assign a physical register to.
 
 bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
                                SmallVectorImpl<Register> &SplitVRegs) {
@@ -345,6 +341,23 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
       continue;
     }
   }
+
+  void cleanupMBBLiveIns() {
+  for (MachineBasicBlock &MBB : *MF) {
+    // Collect regs to remove first to avoid invalidating iterator
+    SmallVector<Register, 8> ToRemove;
+    
+    for (const auto &LI : MBB.liveins()) {
+      if (Register::isVirtualRegister(LI.PhysReg) && !VRM->hasPhys(LI.PhysReg)) {
+        ToRemove.push_back(LI.PhysReg);
+      }
+    }
+    
+    for (Register Reg : ToRemove) {
+      MBB.removeLiveIn(Reg);
+    }
+  }
+}
 
   // 4. Try to Evict (Reverse Spilling)
   for (MCRegister &PhysReg : PhysRegSpillCands) {
@@ -492,7 +505,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   MF = &mf;
 
-  // Standard Analyses
+  // 1. Initialize Analysis Passes
   RegClassInfo.runOnMachineFunction(*MF);
   auto &LISWrapper = getAnalysis<LiveIntervalsWrapperPass>();
   auto &VRMWrapper = getAnalysis<VirtRegMapWrapperLegacy>();
@@ -500,7 +513,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   RegAllocBase::init(VRMWrapper.getVRM(), LISWrapper.getLIS(), 
                      getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
 
-  // Helper References
+  // 2. Setup Local References
   MachineRegisterInfo &MRI = MF->getRegInfo(); 
   VirtRegMap &VRM = VRMWrapper.getVRM();
   LiveIntervals &LIS = LISWrapper.getLIS();
@@ -515,22 +528,21 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset(
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
-  // --- RUN ALLOCATION ---
+  // 3. Run Allocation
   allocatePhysRegs();
   
-  // --- RUN CLEANUP ---
+  // 4. Run Cleanup (Fixes the PHI error and the Assertion)
   
-  // 1. Fix PHI ordering (fixes "PHI instruction after non-PHI")
+  // Fix PHI nodes that got pushed down by the Spiller
   for (MachineBasicBlock &MBB : *MF) {
       fixupPHIs(MBB);
   }
 
-  // 2. Clean up LiveIns (Double check against the Assertion failure)
-  cleanupMBBLiveIns();
+  // Remove spilled registers from LiveIns
+  cleanupMBBLiveIns(*MF, VRM);
 
+  // 5. Finalize
   postOptimization();
-  
-  // Clean up memory
   releaseMemory(); 
   
   return true;
