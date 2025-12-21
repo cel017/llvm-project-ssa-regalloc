@@ -315,6 +315,53 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
   return 0; 
 }
 
+void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+
+  for (MachineBasicBlock &MBB : MF) {
+    SmallVector<MachineInstr*, 8> Phis;
+    for (MachineInstr &MI : MBB) {
+      if (!MI.isPHI()) break; 
+      Phis.push_back(&MI);
+    }
+
+    if (Phis.empty()) continue;
+
+    MachineBasicBlock::iterator InsertPos = MBB.getFirstNonPHI();
+
+    for (MachineInstr *PhiMI : Phis) {
+      Register PhiDef = PhiMI->getOperand(0).getReg();
+      if (!PhiDef.isVirtual()) continue;
+
+      const TargetRegisterClass *RC = MRI.getRegClass(PhiDef);
+      Register NewReg = MRI.createVirtualRegister(RC);
+      
+      VRM.grow(); 
+
+      MachineInstr *CopyMI = BuildMI(MBB, InsertPos, DebugLoc(), 
+                                     TII->get(TargetOpcode::COPY), NewReg)
+                                     .addReg(PhiDef);
+
+      SI.insertMachineInstrInMaps(*CopyMI);
+
+      for (MachineOperand &UseMO : llvm::make_early_inc_range(MRI.use_operands(PhiDef))) {
+        MachineInstr *UseMI = UseMO.getParent();
+        if (UseMI == CopyMI) continue;
+        UseMO.setReg(NewReg);
+      }
+
+      LIS.createAndComputeVirtRegInterval(NewReg);
+      LIS.removeInterval(PhiDef);
+      LIS.createAndComputeVirtRegInterval(PhiDef);
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Allocation Phase (Unified)
+// Iterates *MF to catch Unreachable Blocks + Spills
+//===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
   SmallVector<Register, 64> VRegsToAlloc;
 
@@ -385,114 +432,6 @@ void RASSA::allocatePhysRegs() {
        // This usually means the register was dead or something internal failed.
        // It is not necessarily a fatal error, but worth logging.
        LLVM_DEBUG(dbgs() << "Warning: Register " << Reg << " spilled but created no new VRegs (Dead?)\n");
-    }
-  }
-}
-
-void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotIndexes &SI) {
-  MachineRegisterInfo &MRI = MF.getRegInfo();
-  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
-
-  for (MachineBasicBlock &MBB : MF) {
-    SmallVector<MachineInstr*, 8> Phis;
-    for (MachineInstr &MI : MBB) {
-      if (!MI.isPHI()) break; 
-      Phis.push_back(&MI);
-    }
-
-    if (Phis.empty()) continue;
-
-    MachineBasicBlock::iterator InsertPos = MBB.getFirstNonPHI();
-
-    for (MachineInstr *PhiMI : Phis) {
-      Register PhiDef = PhiMI->getOperand(0).getReg();
-      if (!PhiDef.isVirtual()) continue;
-
-      const TargetRegisterClass *RC = MRI.getRegClass(PhiDef);
-      Register NewReg = MRI.createVirtualRegister(RC);
-      
-      VRM.grow(); 
-
-      MachineInstr *CopyMI = BuildMI(MBB, InsertPos, DebugLoc(), 
-                                     TII->get(TargetOpcode::COPY), NewReg)
-                                     .addReg(PhiDef);
-
-      SI.insertMachineInstrInMaps(*CopyMI);
-
-      for (MachineOperand &UseMO : llvm::make_early_inc_range(MRI.use_operands(PhiDef))) {
-        MachineInstr *UseMI = UseMO.getParent();
-        if (UseMI == CopyMI) continue;
-        UseMO.setReg(NewReg);
-      }
-
-      LIS.createAndComputeVirtRegInterval(NewReg);
-      LIS.removeInterval(PhiDef);
-      LIS.createAndComputeVirtRegInterval(PhiDef);
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// Allocation Phase (Unified)
-// Iterates *MF to catch Unreachable Blocks + Spills
-//===----------------------------------------------------------------------===//
-void RASSA::allocatePhysRegs() {
-  SmallVector<Register, 64> VRegsToAlloc;
-
-  // 1. Collect ALL registers (reachable + unreachable)
-  for (MachineBasicBlock &MBB : *MF) {
-    for (MachineInstr &MI : MBB) {
-      if (MI.isDebugInstr()) continue;
-      for (MachineOperand &MO : MI.defs()) {
-        if (!MO.isReg()) continue;
-        Register Reg = MO.getReg();
-        if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
-           VRegsToAlloc.push_back(Reg);
-        }
-      }
-    }
-  }
-
-  // 2. Process worklist (including dynamic spills)
-  for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
-    Register Reg = VRegsToAlloc[i];
-
-    if (VRM->hasPhys(Reg)) continue;
-
-    // Safety: Ensure liveness exists
-    if (!LIS->hasInterval(Reg)) {
-        LIS->createAndComputeVirtRegInterval(Reg);
-    }
-    
-    LiveInterval &LI = LIS->getInterval(Reg);
-    // Dead code handling
-    if (LI.empty()) LI.setWeight(0.0f);
-    
-    // Safety: Prevent infinite loops on spill artifacts
-    if (i >= VRegsToAlloc.size()) { 
-        LI.markNotSpillable();
-    }
-
-    SmallVector<Register, 4> SplitVRegs;
-    MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
-
-    if (PhysReg) {
-      Matrix->assign(LI, PhysReg);
-    } 
-    else if (SplitVRegs.empty()) {
-       report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
-                          Twine(Reg.id()));
-    }
-
-    if (!SplitVRegs.empty()) {
-      VRM->grow(); 
-      for (Register NewReg : SplitVRegs) {
-        if (!LIS->hasInterval(NewReg)) {
-           LIS->createAndComputeVirtRegInterval(NewReg);
-        }
-        LIS->getInterval(NewReg).markNotSpillable();
-        VRegsToAlloc.push_back(NewReg);
-      }
     }
   }
 }
@@ -610,14 +549,14 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   // 1. Sanity Check LIS vs VRM
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     unsigned Reg = Register::index2VirtReg(i);
-    if (MRI->reg_nodbg_empty(Reg)) continue; // Skip unused regs
+    if (MRI.reg_nodbg_empty(Reg)) continue; // Skip unused regs
 
     if (VRM.hasPhys(Reg)) {
         // This is good
     } else {
         // This reg has no phys assignment. 
         // Is it still in the MIR?
-        if (!MRI->reg_empty(Reg)) {
+        if (!MRI.reg_empty(Reg)) {
             dbgs() << "ERROR: VReg " << printReg(Reg) << " has no PhysReg but is still used in instructions!\n";
         }
         // Is it still in LiveIntervals?
