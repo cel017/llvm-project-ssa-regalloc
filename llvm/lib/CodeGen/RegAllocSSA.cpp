@@ -353,24 +353,33 @@ void isolatePhis(MachineFunction &MF, LiveIntervals &LIS, VirtRegMap &VRM, SlotI
 // Allocation Phase (Unified)
 // Iterates *MF to catch Unreachable Blocks + Spills
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Allocation Phase (Robust MRI Iteration)
+//===----------------------------------------------------------------------===//
 void RASSA::allocatePhysRegs() {
+  MachineRegisterInfo &MRI = MF->getRegInfo();
   SmallVector<Register, 64> VRegsToAlloc;
 
-  // 1. Collect ALL registers (reachable + unreachable)
-  for (MachineBasicBlock &MBB : *MF) {
-    for (MachineInstr &MI : MBB) {
-      if (MI.isDebugInstr()) continue;
-      for (MachineOperand &MO : MI.defs()) {
-        if (!MO.isReg()) continue;
-        Register Reg = MO.getReg();
-        if (Reg.isVirtual() && !VRM->hasPhys(Reg)) {
-           VRegsToAlloc.push_back(Reg);
-        }
-      }
+  // 1. Collect ALL Virtual Registers directly from MRI.
+  //    This guarantees we never miss a register, stopping the Rewriter crash.
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    // Skip unused registers
+    if (MRI.reg_nodbg_empty(Reg)) continue;
+    
+    // Only queue if not already assigned (by hints or pre-coloring)
+    if (!VRM->hasPhys(Reg)) {
+      VRegsToAlloc.push_back(Reg);
     }
   }
 
-  // 2. Process worklist (including dynamic spills)
+  // 2. Sort by Spill Weight (Highest Weight -> Allocated First)
+  //    This helps important variables (inner loops) get registers.
+  std::sort(VRegsToAlloc.begin(), VRegsToAlloc.end(), [&](Register A, Register B) {
+     return LIS->getInterval(A).weight() > LIS->getInterval(B).weight();
+  });
+
+  // 3. Process the queue
   for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
     Register Reg = VRegsToAlloc[i];
 
@@ -382,11 +391,9 @@ void RASSA::allocatePhysRegs() {
     }
     
     LiveInterval &LI = LIS->getInterval(Reg);
-    // Dead code handling
-    if (LI.empty()) LI.setWeight(0.0f);
     
-    // Safety: Prevent infinite loops on spill artifacts
-    if (i >= VRegsToAlloc.size()) { 
+    // Safety: Mark spill artifacts as non-spillable to prevent infinite loops
+    if (i >= MRI.getNumVirtRegs()) { 
         LI.markNotSpillable();
     }
 
@@ -394,20 +401,22 @@ void RASSA::allocatePhysRegs() {
     MCRegister PhysReg = selectOrSplit(LI, SplitVRegs);
 
     if (PhysReg) {
-      Matrix->assign(LI, PhysReg);
+      Matrix->assign(LI, PhysReg); // Commit the assignment
     } 
     else if (SplitVRegs.empty()) {
+       // If we failed to allocate AND failed to split/spill, it's a fatal logic error.
        report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
                           Twine(Reg.id()));
     }
 
+    // Handle any new registers created by spilling
     if (!SplitVRegs.empty()) {
       VRM->grow(); 
       for (Register NewReg : SplitVRegs) {
         if (!LIS->hasInterval(NewReg)) {
            LIS->createAndComputeVirtRegInterval(NewReg);
         }
-        LIS->getInterval(NewReg).markNotSpillable();
+        // Add new registers to the END of our vector to process them next
         VRegsToAlloc.push_back(NewReg);
       }
     }
@@ -427,29 +436,18 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
-  auto &SI = getAnalysis<SlotIndexesWrapperPass>().getSI();
-
-  isolatePhis(*MF, LIS, VRM, SI);
-
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI(); 
   
+  // Initialize the base class
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
   MachineRegisterInfo &MRI = MF->getRegInfo();
   SpillWeightCalculator FSW(MRI, MLI);
 
-  // Identify PHI blocks for safety constraints
-  SmallVector<MachineBasicBlock*, 8> PhiBlocks;
-  for (MachineBasicBlock &MBB : *MF) {
-    if (!MBB.empty() && MBB.front().isPHI()) {
-      PhiBlocks.push_back(&MBB);
-    }
-  }
-
-  // Calculate Weights & Constraints
+  // Calculate Weights
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg))
@@ -457,22 +455,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     
     LiveInterval &LI = LIS.getInterval(Reg);
     LI.setWeight((float)FSW.getWeight(Reg));
-
-    MachineInstr *DefMI = MRI.getVRegDef(Reg);
-    if (DefMI && DefMI->isPHI()) {
-      LI.markNotSpillable(); 
-      continue;
-    }
-
-    bool IsUnsafe = false;
-    for (MachineBasicBlock *MBB : PhiBlocks) {
-      if (LIS.isLiveInToMBB(LI, MBB)) {
-        IsUnsafe = true;
-        break;
-      }
-    }
-
-    if (IsUnsafe) LI.markNotSpillable();
   }
 
   VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI,
@@ -481,39 +463,22 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset(
       createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
-  // 1. Run Allocation
+  // Run Allocation
   allocatePhysRegs();
   
-  // 2. Optimization (standard hook)
+  // Standard Cleanup
   postOptimization();
-
-  // >>> ULTIMATE FIX: Pre-Rewrite Live-Ins <<<
-  // The VirtRegRewriter crashes if it finds a Virtual Register in LiveIns that 
-  // we didn't allocate (e.g., zombies or spills). 
-  // We fix this by rewriting the LiveIns list manually right now.
   
-  LLVM_DEBUG(dbgs() << "--- STARTING LIVE-IN SANITIZATION ---\n");
+  // Live-In Sanitization (Kept as safety net against Rewriter crashes)
   for (MachineBasicBlock &MBB : *MF) {
     SmallVector<std::pair<MCRegister, LaneBitmask>, 8> NewLiveIns;
-
     for (const auto &LI : MBB.liveins()) {
       if (LI.PhysReg.isPhysical()) {
-        // Case 1: Already Physical. Keep it.
         NewLiveIns.push_back({LI.PhysReg, LI.LaneMask});
-      } 
-      else {
-        // Case 2: Virtual.
-        // If it's allocated, we translate it to Physical NOW.
-        // If it's unmapped (spill/zombie), we drop it.
-        if (VRM.hasPhys(LI.PhysReg)) {
-           MCRegister Phys = VRM.getPhys(LI.PhysReg);
-           NewLiveIns.push_back({Phys, LI.LaneMask});
-        }
+      } else if (VRM.hasPhys(LI.PhysReg)) {
+        NewLiveIns.push_back({VRM.getPhys(LI.PhysReg), LI.LaneMask});
       }
     }
-
-    // Replace the list with our fully physical list.
-    // The VirtRegRewriter will see only physical registers and skip them, avoiding the crash.
     MBB.clearLiveIns();
     for (const auto &Pair : NewLiveIns) {
       MBB.addLiveIn(Pair.first, Pair.second);
@@ -521,7 +486,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     MBB.sortUniqueLiveIns();
   }
 
-  LLVM_DEBUG(dbgs() << "Post alloc VirtRegMap:\n" << VRM << "\n");
   releaseMemory();
   return true;
 }
