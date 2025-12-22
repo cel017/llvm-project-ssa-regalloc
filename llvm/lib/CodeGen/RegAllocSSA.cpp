@@ -252,20 +252,30 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-  
-  // MLI is a Reference (&), so we don't need to dereference it later.
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
-  // ERROR FIXED: Removed '*' from MLI. 
-  // calculateSpillWeightsAndHints expects (LIS, MF, VRM_Ptr, MLI_Ref, MBFI_Ref)
-  calculateSpillWeightsAndHints(LIS, *MF, &VRM, MLI, MBFI);
-
-  // ERROR FIXED: Removed '*' from MLI.
+  // Initialize the Spill Weight Calculator (VirtRegAuxInfo)
+  // We construct this EARLY so we can use it to calculate weights immediately.
   VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, 
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
-                      
+
+  // FIX: Manually calculate spill weights for all registers using VRAI.
+  // This replaces the missing 'calculateSpillWeightsAndHints' function.
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    if (MRI.reg_nodbg_empty(Reg)) continue;
+    
+    // Ensure the interval exists
+    if (!LIS.hasInterval(Reg)) LIS.createAndComputeVirtRegInterval(Reg);
+    
+    // Ask VRAI to calculate and update the weight on the LiveInterval
+    VRAI.calculateSpillWeightAndHint(LIS.getInterval(Reg));
+  }
+
+  // Initialize Spiller with the prepared VRAI
   SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
   // Run the Robust Allocation
