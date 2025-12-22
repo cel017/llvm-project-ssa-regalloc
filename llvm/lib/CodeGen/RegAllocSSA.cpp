@@ -252,29 +252,26 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  
+  // MLI is a Reference (&), so we don't need to dereference it later.
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   
   RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
   
-  MachineRegisterInfo &MRI = MF->getRegInfo();
-  
-  // Calculate simple spill weights
-  calculateSpillWeightsAndHints(LIS, *MF, &VRM, *MLI, MBFI);
+  // ERROR FIXED: Removed '*' from MLI. 
+  // calculateSpillWeightsAndHints expects (LIS, MF, VRM_Ptr, MLI_Ref, MBFI_Ref)
+  calculateSpillWeightsAndHints(LIS, *MF, &VRM, MLI, MBFI);
 
-  // Initialize Spiller
-  VirtRegAuxInfo VRAI(*MF, LIS, VRM, *MLI, MBFI, 
+  // ERROR FIXED: Removed '*' from MLI.
+  VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, 
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
+                      
   SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
   // Run the Robust Allocation
   allocatePhysRegs();
   
-  // Cleanup
   postOptimization();
-  
-  // DO NOT MANIPULATE LIVE-INS MANUALLY.
-  // The rewriter will handle it if the map is correct.
-
   releaseMemory();
   return true;
 }
