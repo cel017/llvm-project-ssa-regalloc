@@ -71,30 +71,34 @@ namespace llvm {
   }
 }
 
-// 3-instruction XOR swap: A=A^B; B=B^A; A=A^B
-// Works for integer registers on RISC-V/x86 without needing a 3rd register.
+// Helper to find the target-specific XOR opcode by name.
+// This works for RISC-V because the instruction is literally named "XOR".
+static unsigned getXorOpcode(const TargetInstrInfo *TII) {
+    int Num = TII->getNumOpcodes();
+    for (int i = 0; i < Num; ++i) {
+        // Check for RISC-V "XOR"
+        if (StringRef(TII->getName(i)) == "XOR") return i;
+    }
+    llvm_unreachable("XOR instruction not found! (Is this the right target?)");
+}
+
 void SSADeconstruction::emitXorSwap(MachineBasicBlock &MBB, 
                                     MachineBasicBlock::iterator I, 
                                     MCRegister R1, MCRegister R2) const {
-    // NOTE: This assumes integer registers. For floats, you usually need a scratch 
-    // register or memory stack slot.
-    unsigned XorOp = 0;
-    
-    // Auto-detect XOR opcode (This is a heuristic, adjust for your target if needed)
-    // For RISC-V 'XOR', for x86 'XORRR'
-    // Simplified: We assume RISC-V here based on your context.
-    XorOp = TII->get(TargetOpcode::XOR).getOpcode(); 
-    // If generic XOR isn't available, we'd look up "XOR" in target info, 
-    // but for now we rely on the target having a standard XOR instruction.
+    // 1. Find the target-specific opcode dynamically
+    unsigned XorOpcode = getXorOpcode(TII);
 
+    // 2. Emit the 3-XOR Swap Sequence
     // R1 = R1 ^ R2
-    BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::XOR), R1)
+    BuildMI(MBB, I, DebugLoc(), TII->get(XorOpcode), R1)
         .addReg(R1).addReg(R2);
+        
     // R2 = R2 ^ R1
-    BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::XOR), R2)
+    BuildMI(MBB, I, DebugLoc(), TII->get(XorOpcode), R2)
         .addReg(R2).addReg(R1);
+        
     // R1 = R1 ^ R2
-    BuildMI(MBB, I, DebugLoc(), TII->get(TargetOpcode::XOR), R1)
+    BuildMI(MBB, I, DebugLoc(), TII->get(XorOpcode), R1)
         .addReg(R1).addReg(R2);
 }
 
