@@ -1506,7 +1506,6 @@ void TargetPassConfig::addOptimizedRegAlloc() {
 
     // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
-
     addPass(&StackSlotColoringID);
     addPostRewrite();
     addPass(&MachineCopyPropagationID);

@@ -37,10 +37,14 @@ public:
     return "SSA Deconstruction"; 
   }
 
+
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
     // We need the VRM from the allocator to know which PhysRegs were picked
-    AU.addRequired<VirtRegMapWrapperLegacy>(); 
+    AU.addRequired<VirtRegMapWrapperLegacy>();
+    AU.addPreserved<VirtRegMapWrapperLegacy>(); // Essential!
+    AU.addRequired<LiveIntervalsWrapperPass>();
+    AU.addPreserved<LiveIntervalsWrapperPass>(); // Essential!
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
@@ -197,14 +201,7 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
 
   // --- PHASE 3: Rewrite & Remove ---
   for (MachineInstr *Phi : PhisToRemove) {
-    Register DefVReg = Phi->getOperand(0).getReg();
-    MCRegister PhysDef = VRM->getPhys(DefVReg);
-
-    // Replace all uses of the old virtual register with the new physical register
-    if (PhysDef) {
-       MRI->replaceRegWith(DefVReg, PhysDef);
-    }
-    Phi->eraseFromParent();
+    Phi->eraseFromParent(); // Just remove the PHI, leave the VRegs alone!
   }
 
   return !PhisToRemove.empty();
