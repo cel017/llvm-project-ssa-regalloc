@@ -10,6 +10,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 
 using namespace llvm;
 
@@ -38,15 +39,19 @@ public:
   }
 
 
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.setPreservesCFG();
-    // We need the VRM from the allocator to know which PhysRegs were picked
-    AU.addRequired<VirtRegMapWrapperLegacy>();
-    AU.addPreserved<VirtRegMapWrapperLegacy>(); // Essential!
-    AU.addRequired<LiveIntervalsWrapperPass>();
-    AU.addPreserved<LiveIntervalsWrapperPass>(); // Essential!
-    MachineFunctionPass::getAnalysisUsage(AU);
-  }
+void SSADeconstruction::getAnalysisUsage(AnalysisUsage &AU) const override {
+  AU.setPreservesCFG();
+  
+  // We need VRM to know where the VRegs were assigned
+  AU.addRequired<VirtRegMapWrapperLegacy>();
+  AU.addPreserved<VirtRegMapWrapperLegacy>(); 
+  
+  // We need LIS if we are doing any liveness propagation
+  AU.addRequired<LiveIntervalsWrapperPass>();
+  AU.addPreserved<LiveIntervalsWrapperPass>(); 
+
+  MachineFunctionPass::getAnalysisUsage(AU);
+}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
@@ -200,7 +205,7 @@ bool SSADeconstruction::runOnMachineFunction(MachineFunction &MF) {
   }
 
   // --- PHASE 3: Rewrite & Remove ---
-  for (MachineInstr *Phi : PhisToRemove) {
+for (MachineInstr *Phi : PhisToRemove) {
     Phi->eraseFromParent(); // Just remove the PHI, leave the VRegs alone!
   }
 
