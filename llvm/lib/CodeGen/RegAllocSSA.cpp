@@ -283,6 +283,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   
   postOptimization();
   releaseMemory();
+  
+  // FIX: Explicitly declare that we have satisfied the NoPHIs property.
+  // Since we requested SSA, the pipeline expects us to lower it fully.
+  mf.getProperties().set(MachineFunctionProperties::Property::NoPHIs);
+
   return true;
 }
 
