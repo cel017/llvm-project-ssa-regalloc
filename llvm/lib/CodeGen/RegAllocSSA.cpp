@@ -291,12 +291,36 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
       LI.setWeight(0.0f);
     }
   }
+  
+  for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    if (MRI.reg_nodbg_empty(Reg) || !LIS.hasInterval(Reg)) continue;
+
+    LiveInterval &LI = LIS.getInterval(Reg);
+
+    // If this register is an IMPLICIT_DEF or has other weirdness,
+    // mark it as NOT SPILLABLE. 
+    // This prevents the Spiller from ever calling isRematerializable on it.
+    bool IsBroken = false;
+    for (MachineInstr &DefMI : MRI.def_instructions(Reg)) {
+        if (DefMI.isImplicitDef() || DefMI.isPHI()) {
+            IsBroken = true;
+            break;
+        }
+    }
+
+    if (IsBroken) {
+        LI.markNotSpillable(); 
+        LI.setWeight(1000000.0f); // Give it a huge weight so it gets a register first
+    }
+  }
 
   // 4. Initialize Spiller and proceed to Allocation
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  
   SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
-
+  
   allocatePhysRegs();
 
   // 5. Cleanup
