@@ -11,6 +11,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/InitializePasses.h"
 
 using namespace llvm;
 
@@ -80,7 +81,7 @@ INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_END(SSADeconstruction, "ssa-deconstruction",
                     "SSA Deconstruction", false, false)
-                      
+
 namespace llvm {
   FunctionPass *createSSADeconstructionPass() {
     return new SSADeconstruction();
