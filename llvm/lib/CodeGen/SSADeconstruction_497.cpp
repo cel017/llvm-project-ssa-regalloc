@@ -40,7 +40,7 @@ public:
   }
 
 
-void SSADeconstruction::getAnalysisUsage(AnalysisUsage &AU) const {
+void getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
   AU.addRequired<VirtRegMapWrapperLegacy>();
   AU.addRequired<LiveIntervalsWrapperPass>();
