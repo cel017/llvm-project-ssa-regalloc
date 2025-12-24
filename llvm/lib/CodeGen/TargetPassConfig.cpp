@@ -1460,6 +1460,9 @@ namespace llvm {
   extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
   extern FunctionPass *createCriticalEdgeRemovalPass();
   extern FunctionPass *createSSADeconstructionPass();
+  
+  void initializeRegAllocSSAPass(PassRegistry &);
+  void initializeSSADeconstructionPass(PassRegistry &);
 }
 
 /// Add standard target-independent passes that are tightly coupled with
@@ -1499,6 +1502,7 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     initializeVirtRegMapWrapperLegacyPass(PR);
     initializeLiveIntervalsWrapperPassPass(PR);
     initializeSSADeconstructionPass(PR);
+    initializeRegAllocSSAPass(PR);
 
     addPass(createCriticalEdgeRemovalPass());
     addPass(createSSARegisterAllocator());
@@ -1521,7 +1525,7 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     addPass(&MachineLICMID);
 
     return;
-}
+  }
 
   // Standard pipeline
   addPass(&PHIEliminationID);
