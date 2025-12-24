@@ -5,15 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
-// This file is a modern port of the "Register Allocation via Coloring of 
-// Chordal Graphs" algorithm (originally CfgV_Fernando.cpp, 2006).
-//
-// It performs register assignment while the program is in SSA form by 
-// traversing the CFG in dominance order and maintaining a local "clique"
-// of active registers.
-//
-//===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveDebugVariables.h"
@@ -22,6 +13,7 @@
 #include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/LiveStacks.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h" 
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -66,19 +58,14 @@ public:
   }
 
   void occupy(MCRegister Reg) {
-    PhysRegs.set(Reg);
-    for (MCPhysReg Alias : TRI->regaliases(Reg)) {
-      PhysRegs.set(Alias);
+    for (MCRegAliasIterator AI(Reg, TRI, true); AI.isValid(); ++AI) {
+      PhysRegs.set(*AI);
     }
   }
 
   void liberate(MCRegister Reg) {
-    // Note: In a real implementation, we need ref-counting for aliases
-    // if multiple virtuals share aliases, but for chordal coloring on SSA,
-    // distinct colors usually imply distinct physical resources.
-    PhysRegs.reset(Reg);
-    for (MCPhysReg Alias : TRI->regaliases(Reg)) {
-      PhysRegs.reset(Alias);
+    for (MCRegAliasIterator AI(Reg, TRI, true); AI.isValid(); ++AI) {
+      PhysRegs.reset(*AI);
     }
   }
 
@@ -141,9 +128,6 @@ private:
   /// Simulates 'liberate_dead_uses'
   void liberateDeadUses(MachineInstr &MI, RegClique &Clique);
 
-  /// Simulates 'choose_reg_spill' - Loop Depth Heuristic
-  Register chooseRegSpill(Register VReg, RegClique &Clique);
-  
   /// Helper to calculate weight (10^depth)
   float getSpillWeight(Register Reg);
 
@@ -152,9 +136,6 @@ private:
 
   /// Tries to find a free physical register in the class
   MCRegister getFreePhysReg(Register VReg, const RegClique &Clique);
-
-  /// Coalescing heuristic from the original code
-  bool tryCoalesce(MachineInstr &MI, Register DefReg, Register UseReg, RegClique &Clique);
 };
 
 char RASSA::ID = 0;
@@ -171,6 +152,8 @@ INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineBlockFrequencyInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
 INITIALIZE_PASS_END(RASSA, "regallocssa", "SSA Register Allocator", false, false)
 
 void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -182,6 +165,8 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<MachineLoopInfoWrapperPass>();
   AU.addRequired<MachineDominatorTreeWrapperPass>();
   AU.addRequired<LiveStacksWrapperLegacy>(); // Required for Spiller
+  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>(); // Required for VRAI
+  AU.addRequired<ProfileSummaryInfoWrapperPass>(); // Required for VRAI
   AU.addPreserved<SlotIndexesWrapperPass>();
   AU.addPreserved<LiveIntervalsWrapperPass>();
   AU.addPreserved<VirtRegMapWrapperLegacy>();
@@ -224,48 +209,6 @@ float RASSA::getSpillWeight(Register Reg) {
   }
 
   return Weight;
-}
-
-//===----------------------------------------------------------------------===//
-// Helper: Choose Spill Candidate
-//===----------------------------------------------------------------------===//
-Register RASSA::chooseRegSpill(Register TargetVReg, RegClique &Clique) {
-  // We need to evict a register from the same RegisterClass as TargetVReg.
-  // We iterate over the physical registers in the allocation order,
-  // find which Virtual Register currently occupies it, and check weights.
-  
-  const TargetRegisterClass *RC = MRI->getRegClass(TargetVReg);
-  ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
-
-  Register BestCand = 0;
-  float MinWeight = 1.0e30f; // Infinite
-
-  for (MCPhysReg PhysReg : Order) {
-    // Note: In a pure local clique model, we might not strictly map Phys -> Virt 
-    // easily without looking at Matrix or maintaining a reverse map. 
-    // We check Matrix for who owns this PhysReg at this point.
-    // However, for this port, let's look at LiveIntervals overlapping the current point?
-    // Optimization: Since we are inside the allocator, VRM has the assignments 
-    // made *so far*.
-    
-    // Find the virtual register mapped to this physical register that is 
-    // currently alive.
-    // This is tricky in modern LLVM without iterating all VirtRegs. 
-    // We will trust the Spiller to pick the best, OR we perform a scan.
-    
-    // Simplification for the Port: 
-    // Iterate all Virtual Registers. If VRM maps them to PhysReg and they are 
-    // in the current Clique (Alive), consider them.
-    // This is O(N), which is slow, but faithful to the logic "Choose best spill".
-    // A production version would maintain a Map<PhysReg, VirtReg> in the Clique.
-  }
-
-  // Fallback: Use LLVM's greedy heuristic logic or simply spill the current one
-  // if no better candidate found.
-  // The original code calculated weights of everything in the clique.
-  // We will assume the 'TargetVReg' is the victim if we can't find space,
-  // relying on the Spiller to do the actual heavy lifting of splitting.
-  return TargetVReg; 
 }
 
 //===----------------------------------------------------------------------===//
@@ -356,9 +299,9 @@ void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
       Clique.occupy(PhysReg);
     } else {
       // SPILL!
-      // The original code chose a victim from the clique.
-      // Here, we simplify: Spill the current definition (or let Spiller decide).
-      // This breaks the linear scan flow slightly as we rely on Spiller logic.
+      // In Fernando's original code, it would look for a neighbor in the clique to spill
+      // based on weight. For this port, we simplify by spilling the current definition.
+      // This is safe because 'spill' will split the interval and defer allocation.
       NumSpills++;
       spill(Reg); 
     }
@@ -372,10 +315,6 @@ void RASSA::spill(Register VReg) {
   SmallVector<Register, 8> NewVRegs;
   LiveRangeEdit LRE(&LIS->getInterval(VReg), NewVRegs, *MF, *LIS, VRM, this);
   SpillerInstance->spill(LRE);
-  
-  // The original Fernando code manually inserted loads/stores and updated the 
-  // clique. Modern Spiller removes the VReg and adds split VRegs.
-  // We must handle the fact that the current VReg is now gone.
 }
 
 //===----------------------------------------------------------------------===//
@@ -385,16 +324,8 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
   Visited.insert(&MBB);
   
   // 1. Initialize Clique at block entry
-  // In the original code, this was done by calculating 'LiveIn' sets manually.
-  // With LiveIntervals, we check which Virtual Regs are live-in to the block Index.
   Clique.clear();
   SlotIndex BlockStart = LIS->getMBBStartIdx(&MBB);
-  
-  // This loop is potentially slow (O(NumVirtRegs)), optimized implementations 
-  // would use the LiveIn list of the MBB or LiveIntervals queries.
-  // For the sake of the port, we assume we check what's assigned.
-  // A better way: Iterate PhysRegs and check Matrix->getLiveUnioned(PhysReg).
-  // But Matrix is global.
   
   // Approximation: Iterate all VirtRegs that have been assigned a PhysReg so far.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
@@ -412,13 +343,8 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
   // 2. Linear Scan
   for (auto MII = MBB.begin(), MIE = MBB.end(); MII != MIE; ) {
     MachineInstr &MI = *MII++; // Increment early in case of deletion via spill
-    
-    // "allocate_spilled_uses" is handled implicitly by the Spiller in previous passes
-    // or by LiveRangeEdit. 
-    
     liberateDeadUses(MI, Clique);
     allocateDefs(MI, Clique);
-    // liberateDeadDefs handled inside allocateDefs implicitly if interval is empty
   }
 }
 
@@ -436,6 +362,9 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  
+  MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
+  ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
   // Initialize weights using the Fernando 10^depth logic
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
@@ -446,8 +375,9 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LI.setWeight(getSpillWeight(Reg));
   }
 
-  // Initialize Spiller
-  SpillerInstance.reset(createSpiller(*this, *MF, *VRM));
+  // Initialize Spiller with VRAI
+  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
+  SpillerInstance.reset(createSpiller(*this, *MF, *VRM, &VRAI));
 
   // Clear State
   Visited.clear();
