@@ -36,6 +36,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include <queue>
 #include <algorithm>
+#include "llvm/CodeGen/Spiller.h"
 
 using namespace llvm;
 
