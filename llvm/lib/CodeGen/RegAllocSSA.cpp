@@ -268,11 +268,21 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg)) continue;
     
+    // SAFETY CHECK: Ensure the register has a definition.
+    // VirtRegAuxInfo::isRematerializable will crash if the def is null.
+    if (!MRI.getVRegDef(Reg)) continue;
+
     // Ensure the interval exists
     if (!LIS.hasInterval(Reg)) LIS.createAndComputeVirtRegInterval(Reg);
     
-    // Ask VRAI to calculate and update the weight on the LiveInterval
-    VRAI.calculateSpillWeightAndHint(LIS.getInterval(Reg));
+    LiveInterval &LI = LIS.getInterval(Reg);
+    
+    // Only calculate weight if the interval isn't empty
+    if (!LI.empty()) {
+      VRAI.calculateSpillWeightAndHint(LI);
+    } else {
+      LI.setWeight(0.0f);
+    }
   }
 
   // Initialize Spiller with the prepared VRAI
