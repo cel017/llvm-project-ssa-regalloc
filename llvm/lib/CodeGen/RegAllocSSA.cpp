@@ -380,8 +380,8 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   // Initialize Spiller with VRAI
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
   
-  // FIX: Pass MBFI as the 4th argument, before *MLI
-  Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, MBFI, *MLI};
+  // FIX: Remove *MLI from the end. Struct layout is likely just {LIS, LS, MDT, MBFI}
+  Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, MBFI};
   
   SpillerInstance.reset(createInlineSpiller(Analyses, *MF, *VRM, VRAI, Matrix));
 
