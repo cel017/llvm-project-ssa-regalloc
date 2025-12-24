@@ -105,8 +105,14 @@ public:
   RASSA() : MachineFunctionPass(ID) {}
 
   StringRef getPassName() const override { return "SSA Chordal Register Allocator"; }
-
+  
   MachineFunctionProperties getRequiredProperties() const override {
+    return MachineFunctionProperties().set(
+      MachineFunctionProperties::Property::IsSSA);
+  }
+
+  // ADD THIS METHOD:
+  MachineFunctionProperties getSetProperties() const override {
     return MachineFunctionProperties().set(
       MachineFunctionProperties::Property::IsSSA);
   }
