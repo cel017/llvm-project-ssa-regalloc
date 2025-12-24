@@ -351,6 +351,9 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
 //===----------------------------------------------------------------------===//
 // Main Driver
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Main Driver
+//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MF = &mf;
   TRI = MF->getSubtarget().getRegisterInfo();
@@ -375,9 +378,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LI.setWeight(getSpillWeight(Reg));
   }
 
-  // Initialize Spiller with VRAI
+  // Initialize Spiller with VRAI using createInlineSpiller
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
-  SpillerInstance.reset(createSpiller(*this, *MF, *VRM, &VRAI));
+  
+  // FIX: Use createInlineSpiller and pass VRAI by reference
+  SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
 
   // Clear State
   Visited.clear();
