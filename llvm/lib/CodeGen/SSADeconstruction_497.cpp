@@ -39,7 +39,7 @@ public:
   }
 
 
-void SSADeconstruction::getAnalysisUsage(AnalysisUsage &AU) const override {
+void getAnalysisUsage(AnalysisUsage &AU) const override {
   AU.setPreservesCFG();
   
   // We need VRM to know where the VRegs were assigned
