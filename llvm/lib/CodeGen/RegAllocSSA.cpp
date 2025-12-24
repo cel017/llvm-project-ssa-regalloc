@@ -363,8 +363,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-  
-  // FIX: Fetch LiveStacks (Required for Spiller)
   LiveStacks &LS = getAnalysis<LiveStacksWrapperLegacy>().getLS();
 
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
@@ -382,10 +380,10 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   // Initialize Spiller with VRAI
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
   
-  // FIX: Construct RequiredAnalyses struct explicitly
-  // The struct expects {LiveIntervals, LiveStacks, MachineDominatorTree, MachineLoopInfo}
-  Spiller::RequiredAnalyses Analyses(*LIS, LS, *MDT, *MLI);
+  // FIX: Use curly braces {} for aggregate initialization
+  Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, *MLI};
   
+  // Pass Matrix as the last argument (as required by your specific LLVM version)
   SpillerInstance.reset(createInlineSpiller(Analyses, *MF, *VRM, VRAI, Matrix));
 
   // Clear State
@@ -403,5 +401,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset();
   return true;
 }
+
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) { return new RASSA(); }
