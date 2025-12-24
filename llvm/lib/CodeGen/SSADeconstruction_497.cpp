@@ -40,16 +40,15 @@ public:
   }
 
 
-void getAnalysisUsage(AnalysisUsage &AU) const override {
+void SSADeconstruction::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
-  
-  // We need VRM to know where the VRegs were assigned
   AU.addRequired<VirtRegMapWrapperLegacy>();
-  AU.addPreserved<VirtRegMapWrapperLegacy>(); 
-  
-  // We need LIS if we are doing any liveness propagation
   AU.addRequired<LiveIntervalsWrapperPass>();
-  AU.addPreserved<LiveIntervalsWrapperPass>(); 
+
+  // THE FIX: Preserve them here too!
+  AU.addPreserved<VirtRegMapWrapperLegacy>();
+  AU.addPreserved<LiveIntervalsWrapperPass>();
+  AU.addPreserved<SlotIndexesWrapperPass>();
 
   MachineFunctionPass::getAnalysisUsage(AU);
 }
