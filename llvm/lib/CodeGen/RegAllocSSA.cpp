@@ -249,13 +249,15 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
         if (VRM->hasPhys(Reg)) {
           MCRegister Phys = VRM->getPhys(Reg);
           Clique.liberate(Phys);
-          Matrix->unassign(LI); // Remove from Matrix to allow overlap check to pass for others
+          
+          // FIX: DO NOT call Matrix->unassign(LI). 
+          // Unassigning clears the VirtRegMap, which causes the Rewriter to crash later.
+          // Matrix->checkInterference handles non-overlapping reuse naturally.
         }
       }
     }
   }
 }
-
 //===----------------------------------------------------------------------===//
 // Logic: Allocate Defs
 //===----------------------------------------------------------------------===//
