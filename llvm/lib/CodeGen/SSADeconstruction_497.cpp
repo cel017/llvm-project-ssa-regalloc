@@ -71,10 +71,19 @@ private:
 } // end anonymous namespace
 
 char SSADeconstruction::ID = 0;
+
+// 1. Command-line registration (Global Scope is fine)
 static RegisterPass<SSADeconstruction> 
 X("ssa-deconstruction", "SSA Deconstruction", false, false);
 
-// 2. Run the macros at GLOBAL SCOPE (Do NOT wrap these in namespace llvm)
+// Manually forward-declare the function inside the llvm namespace
+namespace llvm {
+  class PassRegistry;
+  void initializeSSADeconstructionPass(PassRegistry &);
+}
+
+// 3. Run the macros at GLOBAL SCOPE
+// The macro will now "find" the declaration above and be happy.
 INITIALIZE_PASS_BEGIN(SSADeconstruction, "ssa-deconstruction",
                       "SSA Deconstruction", false, false)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
@@ -82,7 +91,7 @@ INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_END(SSADeconstruction, "ssa-deconstruction",
                     "SSA Deconstruction", false, false)
 
-// 3. Define the factory function inside the llvm namespace
+// 4. Factory function
 namespace llvm {
   FunctionPass *createSSADeconstructionPass() {
     return new SSADeconstruction();
