@@ -240,59 +240,69 @@ void RASSA::allocatePhysRegs() {
 }
 
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** SSA REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
   MF = &mf;
-
-  RegClassInfo.runOnMachineFunction(*MF);
-
-  // Initialize Analyses
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  
+  // 1. Initialize all required analyses
   auto &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
-  auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
-  auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
-  
-  RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-  
-  // Initialize the Spill Weight Calculator (VirtRegAuxInfo)
-  // We construct this EARLY so we can use it to calculate weights immediately.
-  VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, 
-                      &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
+  auto &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
-  // Use the MRI and LIS already obtained in your runOnMachineFunction
-  MachineRegisterInfo &MRI = MF->getRegInfo();
+  // 2. Initialize the Base and the Auxiliary Info
+  RegAllocBase::init(VRM, LIS, getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
+  VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, &PSI);
+
+  // 3. ISOLATED WEIGHT CALCULATION STAGE
+  // We do this BEFORE we touch any allocation logic.
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
-    
-    // 1. Skip if the register isn't actually used
     if (MRI.reg_nodbg_empty(Reg)) continue;
 
-    // 2. CRITICAL SAFETY: Skip if it has no definition or is an IMPLICIT_DEF.
-    // This is what prevents the GEMM Segmentation Fault.
-    MachineInstr *DefMI = MRI.getVRegDef(Reg);
-    if (!DefMI || DefMI->isImplicitDef()) continue;
+    // A: Skip if it doesn't have an interval
+    if (!LIS.hasInterval(Reg)) continue;
+    LiveInterval &LI = LIS.getInterval(Reg);
+    
+    // B: Skip if the interval is empty or has no values (Common in GEMM)
+    if (LI.empty() || LI.valnos.empty()) {
+      LI.setWeight(0.0f);
+      continue;
+    }
 
-    // 3. Ensure the LiveInterval exists and calculate the weight
-    if (LIS.hasInterval(Reg)) {
-      LiveInterval &LI = LIS.getInterval(Reg);
-      VRAI.calculateSpillWeightAndHint(LI);
+    // C: THE CRITICAL FIX - Check EVERY definition of the register
+    // GEMM often has registers with multiple defs where one is an IMPLICIT_DEF.
+    // isRematerializable crashes if ANY definition is weird.
+    bool IsSafe = true;
+    for (MachineInstr &DefMI : MRI.def_instructions(Reg)) {
+      if (DefMI.isImplicitDef() || DefMI.isPHI()) {
+        IsSafe = false;
+        break;
+      }
+    }
+
+    if (IsSafe) {
+      // Wrap in a try-style check: only calculate if the VReg has a main definition
+      if (MRI.getVRegDef(Reg))
+        VRAI.calculateSpillWeightAndHint(LI);
+      else
+        LI.setWeight(0.0f);
+    } else {
+      LI.setWeight(0.0f);
     }
   }
-  // Initialize Spiller with the prepared VRAI
+
+  // 4. Initialize Spiller and proceed to Allocation
+  auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
+  auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
-  // Run the Robust Allocation
   allocatePhysRegs();
-  
+
+  // 5. Cleanup
   postOptimization();
   releaseMemory();
-  
-  // FIX: Explicitly declare that we have satisfied the NoPHIs property.
-  // Since we requested SSA, the pipeline expects us to lower it fully.
   mf.getProperties().set(MachineFunctionProperties::Property::NoPHIs);
-
   return true;
 }
 
