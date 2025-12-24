@@ -259,6 +259,9 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
 //===----------------------------------------------------------------------===//
 // Logic: Allocate Defs
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Logic: Allocate Defs
+//===----------------------------------------------------------------------===//
 void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
   // "This method assigns a valid physical register to the virtual register."
   
@@ -266,16 +269,29 @@ void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
   if (MI.isCopy()) {
     Register Dest = MI.getOperand(0).getReg();
     Register Src = MI.getOperand(1).getReg();
-    if (Dest.isVirtual() && VRM->hasPhys(Src)) {
-      MCRegister SrcPhys = VRM->getPhys(Src);
-      if (!Clique.isOccupied(SrcPhys) && MRI->getRegClass(Dest)->contains(SrcPhys)) {
-        // Compatibility check passed, Coalesce!
-        // (In a real allocator, we'd check strict interference, here we trust the Clique)
-        if (Matrix->checkInterference(LIS->getInterval(Dest), SrcPhys) == LiveRegMatrix::IK_Free) {
-           Matrix->assign(LIS->getInterval(Dest), SrcPhys);
-           Clique.occupy(SrcPhys);
-           NumJoins++;
-           return;
+    
+    if (Dest.isVirtual()) {
+      MCRegister SrcPhys = 0;
+      
+      // FIX: Handle both Physical and Virtual sources to avoid assertion
+      if (Src.isPhysical()) {
+        SrcPhys = Src.asMCReg();
+      } else if (Src.isVirtual() && VRM->hasPhys(Src)) {
+        SrcPhys = VRM->getPhys(Src);
+      }
+      
+      // If we found a valid physical source candidate
+      if (SrcPhys) {
+        // Check if the physical register is free in the Clique and compatible with Dest
+        if (!Clique.isOccupied(SrcPhys) && MRI->getRegClass(Dest)->contains(SrcPhys)) {
+          // Compatibility check passed, Coalesce!
+          // (In a real allocator, we'd check strict interference, here we trust the Clique + Matrix)
+          if (Matrix->checkInterference(LIS->getInterval(Dest), SrcPhys) == LiveRegMatrix::IK_Free) {
+             Matrix->assign(LIS->getInterval(Dest), SrcPhys);
+             Clique.occupy(SrcPhys);
+             NumJoins++;
+             return;
+          }
         }
       }
     }
