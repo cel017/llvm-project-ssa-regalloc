@@ -163,14 +163,12 @@ bool RASSA::spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
 
 MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
                                 SmallVectorImpl<Register> &SplitVRegs) {
-  
-  // 1. Check Hints (Essential for Copy $x10)
+  // 1. Check Hints
   std::pair<Register, Register> Hint = MRI->getRegAllocationHint(VirtReg.reg());
   if (Hint.second.isPhysical()) {
       MCRegister PhysHint = Hint.second;
-      if (Matrix->checkInterference(VirtReg, PhysHint) == LiveRegMatrix::IK_Free) {
+      if (Matrix->checkInterference(VirtReg, PhysHint) == LiveRegMatrix::IK_Free)
           return PhysHint;
-      }
   }
 
   // 2. Greedy Search
@@ -180,11 +178,16 @@ MCRegister RASSA::selectOrSplit(const LiveInterval &VirtReg,
       return PhysReg;
   }
 
-  // 3. Fallback: Spill
-  // If we can't find a register, we tell the spiller to handle it.
+  // 3. Fallback: Spill (Only if spillable!)
+  if (!VirtReg.isSpillable()) {
+      // If we are here, we ran out of registers for a PHI. 
+      // This usually means the code has too many live PHIs at once.
+      return 0; 
+  }
+
   LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
   spiller().spill(LRE);
-  return 0; // 0 indicates assignment failure (spill)
+  return 0; 
 }
 
 //===----------------------------------------------------------------------===//
@@ -194,8 +197,6 @@ void RASSA::allocatePhysRegs() {
   MachineRegisterInfo &MRI = MF->getRegInfo();
   VRegsToAlloc.clear();
 
-  // STEP 1: COLLECT
-  // Iterate the MRI directly. This cannot miss %0.
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI.reg_nodbg_empty(Reg)) continue;
@@ -204,17 +205,23 @@ void RASSA::allocatePhysRegs() {
     }
   }
 
-  // STEP 2: SORT (Simple Weight)
+  // STEP 2: SORT (Prioritize Unspillable registers)
   std::sort(VRegsToAlloc.begin(), VRegsToAlloc.end(), [&](Register A, Register B) {
-     return LIS->getInterval(A).weight() > LIS->getInterval(B).weight();
+     LiveInterval &LIA = LIS->getInterval(A);
+     LiveInterval &LIB = LIS->getInterval(B);
+     
+     // 1. Unspillable (PHIs) always come first
+     if (LIA.isSpillable() != LIB.isSpillable())
+         return !LIA.isSpillable(); 
+         
+     // 2. Then sort by weight
+     return LIA.weight() > LIB.weight();
   });
 
-  // STEP 3: ALLOCATE
-  for (size_t i = 0; i < VRegsToAlloc.size(); ++i) {
-    Register Reg = VRegsToAlloc[i];
-    if (VRM->hasPhys(Reg)) continue; // Already handled (maybe by hint or pre-alloc)
+  // STEP 3: ALLOCATE (Unchanged, but now processes PHIs first)
+  for (Register Reg : VRegsToAlloc) {
+    if (VRM->hasPhys(Reg)) continue;
 
-    // Verify Interval
     if (!LIS->hasInterval(Reg)) LIS->createAndComputeVirtRegInterval(Reg);
     LiveInterval &LI = LIS->getInterval(Reg);
 
@@ -223,17 +230,14 @@ void RASSA::allocatePhysRegs() {
 
     if (PhysReg) {
       Matrix->assign(LI, PhysReg);
-    } 
-    else if (SplitVRegs.empty()) {
-       // Only crash if we didn't assign AND didn't spill.
-       report_fatal_error("RegAllocSSA: Failed to allocate or spill register " + 
+    } else if (SplitVRegs.empty()) {
+       report_fatal_error("RegAllocSSA: Critical failure. Could not allocate PHI/Unspillable reg " + 
                           Twine(Reg.id()));
     }
 
-    // Handle Spill Artifacts
     if (!SplitVRegs.empty()) {
       for (Register NewReg : SplitVRegs) {
-         VRegsToAlloc.push_back(NewReg); // Process new registers in this same pass
+         VRegsToAlloc.push_back(NewReg);
       }
     }
   }
@@ -319,8 +323,9 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
   auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   
-  SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
-  
+  // Use the basic Spiller instead of InlineSpiller to bypass remat crashes
+  SpillerInstance.reset(createSpiller(*this, *MF, VRM));  
+
   allocatePhysRegs();
 
   // 5. Cleanup
