@@ -13,7 +13,7 @@ OUTPUT_CSV = "benchmark_results.csv"
 TARGET_COUNT = 500  
 
 # --- MATTR=+E (16 Registers) ---
-LLC_MATTR = "-mattr=+e" 
+LLC_MATTR = "-mattr=+e -debug-pass=Structure" 
 
 def parse_requirements(file_path):
     with open(file_path, 'r', errors='ignore') as f:
