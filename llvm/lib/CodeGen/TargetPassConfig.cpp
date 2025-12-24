@@ -1493,6 +1493,9 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // SSA ALLOCATOR PIPELINE
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
+    initializeVirtRegMapWrapperLegacyPass(*PassRegistry::getPassRegistry());
+    initializeLiveIntervalsWrapperPassPass(*PassRegistry::getPassRegistry());
+   
     //------------ PreRA ------------//
     // (Skip PHI Elim, TwoAddress, Scheduler) to keep SSA
     addPass(createCriticalEdgeRemovalPass());
@@ -1502,8 +1505,8 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     addPass(createSSARegisterAllocator());
 
     //------------ PostRA ------------//
+    initializeSSADeconstructionPass(*PassRegistry::getPassRegistry());
     addPass(createSSADeconstructionPass());
-
     // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
     addPass(&StackSlotColoringID);

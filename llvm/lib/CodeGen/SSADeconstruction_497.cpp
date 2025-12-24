@@ -74,6 +74,13 @@ char SSADeconstruction::ID = 0;
 static RegisterPass<SSADeconstruction> 
 X("ssa-deconstruction", "SSA Deconstruction", false, false);
 
+INITIALIZE_PASS_BEGIN(SSADeconstruction, "ssa-deconstruction",
+                      "SSA Deconstruction", false, false)
+INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
+INITIALIZE_PASS_END(SSADeconstruction, "ssa-deconstruction",
+                    "SSA Deconstruction", false, false)
+                      
 namespace llvm {
   FunctionPass *createSSADeconstructionPass() {
     return new SSADeconstruction();
