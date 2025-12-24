@@ -1460,7 +1460,6 @@ namespace llvm {
   extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
   extern FunctionPass *createCriticalEdgeRemovalPass();
   extern FunctionPass *createSSADeconstructionPass();
-  void initializeSSADeconstructionPass(PassRegistry &);
 }
 
 /// Add standard target-independent passes that are tightly coupled with
@@ -1495,14 +1494,11 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
 auto &PR = *PassRegistry::getPassRegistry();
-    
-    initializeVirtRegMapWrapperLegacyPass(PR);
-    initializeLiveIntervalsWrapperPassPass(PR);
-    
-    initializeSSADeconstructionPass(PR);
-
+    // Pre RA
     addPass(createCriticalEdgeRemovalPass());
+    // RA
     addPass(createSSARegisterAllocator());
+    // Post RA
     addPass(createSSADeconstructionPass());
     addPass(&VirtRegRewriterID);
     
