@@ -35,7 +35,8 @@ class RASSA : public MachineFunctionPass, public RegAllocBase {
   // crashing 'isRematerializable' logic in standard LLVM spillers.
   class ManualSSA_Spiller : public Spiller {
   public:
-    void spill(LiveRangeEdit &) override {}
+    // Updated signature to match LLVM's Spiller base class
+    void spill(LiveRangeEdit &, AllocationOrder *Order = nullptr) override {}
     void postOptimization() override {}
   };
   ManualSSA_Spiller MSSASpiller;
@@ -141,8 +142,10 @@ public:
     std::sort(VRegs.begin(), VRegs.end(), [&](Register A, Register B) {
       LiveInterval &LIA = LIS.getInterval(A);
       LiveInterval &LIB = LIS.getInterval(B);
+      // Unspillable registers (PHIs) come first
       if (LIA.isSpillable() != LIB.isSpillable())
         return !LIA.isSpillable(); 
+      // Then sort by weight
       return LIA.weight() > LIB.weight();
     });
 
