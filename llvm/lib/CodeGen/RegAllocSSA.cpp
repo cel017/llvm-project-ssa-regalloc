@@ -261,30 +261,25 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   VirtRegAuxInfo VRAI(*MF, LIS, VRM, MLI, MBFI, 
                       &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
 
-  // FIX: Manually calculate spill weights for all registers using VRAI.
-  // This replaces the missing 'calculateSpillWeightsAndHints' function.
+  // Use the MRI and LIS already obtained in your runOnMachineFunction
   MachineRegisterInfo &MRI = MF->getRegInfo();
   for (unsigned i = 0, e = MRI.getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
+    
+    // 1. Skip if the register isn't actually used
     if (MRI.reg_nodbg_empty(Reg)) continue;
-    
-    // SAFETY CHECK: Ensure the register has a definition.
-    // VirtRegAuxInfo::isRematerializable will crash if the def is null.
-    if (!MRI.getVRegDef(Reg)) continue;
 
-    // Ensure the interval exists
-    if (!LIS.hasInterval(Reg)) LIS.createAndComputeVirtRegInterval(Reg);
-    
-    LiveInterval &LI = LIS.getInterval(Reg);
-    
-    // Only calculate weight if the interval isn't empty
-    if (!LI.empty()) {
+    // 2. CRITICAL SAFETY: Skip if it has no definition or is an IMPLICIT_DEF.
+    // This is what prevents the GEMM Segmentation Fault.
+    MachineInstr *DefMI = MRI.getVRegDef(Reg);
+    if (!DefMI || DefMI->isImplicitDef()) continue;
+
+    // 3. Ensure the LiveInterval exists and calculate the weight
+    if (LIS.hasInterval(Reg)) {
+      LiveInterval &LI = LIS.getInterval(Reg);
       VRAI.calculateSpillWeightAndHint(LI);
-    } else {
-      LI.setWeight(0.0f);
     }
   }
-
   // Initialize Spiller with the prepared VRAI
   SpillerInstance.reset(createInlineSpiller({LIS, LiveStks, MDT, MBFI}, *MF, VRM, VRAI));
 
