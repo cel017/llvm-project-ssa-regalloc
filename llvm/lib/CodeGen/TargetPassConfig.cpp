@@ -1493,22 +1493,35 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // SSA ALLOCATOR PIPELINE
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-auto &PR = *PassRegistry::getPassRegistry();
-    // Pre RA
+    auto &PR = *PassRegistry::getPassRegistry();
+    
+    // Explicitly boot up the analyses so the Pass Manager "sees" them
+    initializeVirtRegMapWrapperLegacyPass(PR);
+    initializeLiveIntervalsWrapperPassPass(PR);
+    initializeSSADeconstructionPass(PR);
+
     addPass(createCriticalEdgeRemovalPass());
-    // RA
     addPass(createSSARegisterAllocator());
-    // Post RA
-    addPass(createSSADeconstructionPass());
+    addPass(createSSADeconstructionPass()); // Now it can find the required analyses
     addPass(&VirtRegRewriterID);
     
     addPass(&StackSlotColoringID);
+
+    // Allow targets to expand pseudo instructions depending on the choice of
+    // registers before MachineCopyPropagation.
     addPostRewrite();
+
+    // Copy propagate to forward register uses and try to eliminate COPYs that
+    // were not coalesced.
     addPass(&MachineCopyPropagationID);
+
+    // Run post-ra machine LICM to hoist reloads / remats.
+    //
+    // FIXME: can this move into MachineLateOptimization?
     addPass(&MachineLICMID);
 
     return;
-  }
+}
 
   // Standard pipeline
   addPass(&PHIEliminationID);
