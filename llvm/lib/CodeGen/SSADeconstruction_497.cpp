@@ -71,27 +71,23 @@ private:
 } // end anonymous namespace
 
 char SSADeconstruction::ID = 0;
-
-// This can stay here
 static RegisterPass<SSADeconstruction> 
 X("ssa-deconstruction", "SSA Deconstruction", false, false);
 
-// --- THE FIX: Wrap everything in the llvm namespace ---
-namespace llvm {
-  void initializeSSADeconstructionPass(PassRegistry &);
-
-  INITIALIZE_PASS_BEGIN(SSADeconstruction, "ssa-deconstruction",
-                        "SSA Deconstruction", false, false)
-  INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
-  INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
-  INITIALIZE_PASS_END(SSADeconstruction, "ssa-deconstruction",
+// 2. Run the macros at GLOBAL SCOPE (Do NOT wrap these in namespace llvm)
+INITIALIZE_PASS_BEGIN(SSADeconstruction, "ssa-deconstruction",
                       "SSA Deconstruction", false, false)
+INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
+INITIALIZE_PASS_END(SSADeconstruction, "ssa-deconstruction",
+                    "SSA Deconstruction", false, false)
 
+// 3. Define the factory function inside the llvm namespace
+namespace llvm {
   FunctionPass *createSSADeconstructionPass() {
     return new SSADeconstruction();
   }
-
-} // end namespace llvm
+}
 
 // Helper to find the target-specific XOR opcode by name.
 // This works for RISC-V because the instruction is literally named "XOR".

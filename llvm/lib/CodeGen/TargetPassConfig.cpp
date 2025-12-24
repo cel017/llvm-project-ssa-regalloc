@@ -1460,6 +1460,7 @@ namespace llvm {
   extern FunctionPass *createSSARegisterAllocator(RegAllocFilterFunc);
   extern FunctionPass *createCriticalEdgeRemovalPass();
   extern FunctionPass *createSSADeconstructionPass();
+  void initializeSSADeconstructionPass(PassRegistry &);
 }
 
 /// Add standard target-independent passes that are tightly coupled with
@@ -1493,22 +1494,18 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // SSA ALLOCATOR PIPELINE
   // ============================================================
   if (RegAlloc == (FunctionPass *(*)())&createSSARegisterAllocator) {
-    initializeVirtRegMapWrapperLegacyPass(*PassRegistry::getPassRegistry());
-    initializeLiveIntervalsWrapperPassPass(*PassRegistry::getPassRegistry());
-   
-    //------------ PreRA ------------//
-    // (Skip PHI Elim, TwoAddress, Scheduler) to keep SSA
+auto &PR = *PassRegistry::getPassRegistry();
+    
+    initializeVirtRegMapWrapperLegacyPass(PR);
+    initializeLiveIntervalsWrapperPassPass(PR);
+    
+    initializeSSADeconstructionPass(PR);
+
     addPass(createCriticalEdgeRemovalPass());
-
-    //------------ RA ------------//
-    // Call the factory directly to ensure RASSA is added, not Greedy.
     addPass(createSSARegisterAllocator());
-
-    //------------ PostRA ------------//
-    initializeSSADeconstructionPass(*PassRegistry::getPassRegistry());
     addPass(createSSADeconstructionPass());
-    // Standard LLVM pass to rewrite VirtRegs -> PhysRegs
     addPass(&VirtRegRewriterID);
+    
     addPass(&StackSlotColoringID);
     addPostRewrite();
     addPass(&MachineCopyPropagationID);
