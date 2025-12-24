@@ -368,7 +368,7 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
-  // Initialize weights using the Fernando 10^depth logic
+  // Initialize weights
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg)) continue;
@@ -380,18 +380,15 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   // Initialize Spiller with VRAI
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
   
-  // FIX: Use curly braces {} for aggregate initialization
-  Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, *MLI};
+  // FIX: Pass MBFI as the 4th argument, before *MLI
+  Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, MBFI, *MLI};
   
-  // Pass Matrix as the last argument (as required by your specific LLVM version)
   SpillerInstance.reset(createInlineSpiller(Analyses, *MF, *VRM, VRAI, Matrix));
 
   // Clear State
   Visited.clear();
   RegClique Clique(TRI);
   
-  // "This algorithm finds an optimal coloring... in one scan of the control flow."
-  // We use DepthFirst traversal to approximate the Chordal ordering.
   MachineBasicBlock *Entry = &MF->front();
   for (auto *MBB : depth_first(Entry)) {
     performLocalAllocation(*MBB, Clique);
