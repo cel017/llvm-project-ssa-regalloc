@@ -351,21 +351,22 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
 //===----------------------------------------------------------------------===//
 // Main Driver
 //===----------------------------------------------------------------------===//
-//===----------------------------------------------------------------------===//
-// Main Driver
-//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MF = &mf;
   TRI = MF->getSubtarget().getRegisterInfo();
   TII = MF->getSubtarget().getInstrInfo();
   MRI = &MF->getRegInfo();
   
+  // 1. Fetch Analyses
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   
+  // FIX: Fetch LiveStacks (Required for Spiller)
+  LiveStacks &LS = getAnalysis<LiveStacksWrapperLegacy>().getLS();
+
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
@@ -378,11 +379,14 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LI.setWeight(getSpillWeight(Reg));
   }
 
-  // Initialize Spiller with VRAI using createInlineSpiller
+  // Initialize Spiller with VRAI
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
   
-  // FIX: Use createInlineSpiller and pass VRAI by reference
-  SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
+  // FIX: Construct RequiredAnalyses struct explicitly
+  // The struct expects {LiveIntervals, LiveStacks, MachineDominatorTree, MachineLoopInfo}
+  Spiller::RequiredAnalyses Analyses(*LIS, LS, *MDT, *MLI);
+  
+  SpillerInstance.reset(createInlineSpiller(Analyses, *MF, *VRM, VRAI, Matrix));
 
   // Clear State
   Visited.clear();
@@ -399,6 +403,5 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   SpillerInstance.reset();
   return true;
 }
-
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) { return new RASSA(); }
