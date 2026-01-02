@@ -8,7 +8,7 @@ import time
 LLC_PATH = "./build_rv1/bin/llc"
 CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
-RESULTS_FILE = "results_spec_metrics.csv"
+RESULTS_FILE = "results_spec_metrics_normal.csv" # Changed name to avoid overwriting starved results
 
 ALLOCATORS = ["ssa", "greedy"]
 
@@ -23,14 +23,9 @@ BENCHMARKS = [
     "linear-algebra/blas/syrk/syrk.c"
     ]
 
-# --- STARVATION (5 Registers: a0-a4) ---
-
-reserved_regs = []
-for r in range(5, 8): reserved_regs.append(f"+reserve-x{r}")   # t0-t2
-for r in range(8, 10): reserved_regs.append(f"+reserve-x{r}")  # s0-s1
-for r in range(15, 18): reserved_regs.append(f"+reserve-x{r}") # a5-a7
-for r in range(18, 32): reserved_regs.append(f"+reserve-x{r}") # s2-s11, t3-t6
-STARVE_FLAGS = f"-mattr={','.join(reserved_regs)}"
+# --- STARVATION FLAGS (DISABLED) ---
+# Set to empty string so LLC uses all registers normally
+STARVE_FLAGS = "" 
 
 # --- DATASET ---
 # Standard Dataset for correctness, Heap arrays for stability
@@ -65,7 +60,6 @@ def get_static_metrics(asm_file):
                 
                 # 3. MOVES (Register Shuffling)
                 # LLVM RISC-V emits 'mv' or 'fmv'. 
-                # Sometimes 'addi rd, rs, 0' is used, but 'mv' is standard alias.
                 elif re.match(r'^(mv|fmv\.d|fmv\.w|fmv\.x\.w|fmv\.w\.x)$', opcode):
                     metrics['move'] += 1
                     
@@ -99,7 +93,7 @@ def get_exec_time(exe_path):
         return None
 
 def main():
-    print(f"Starting SPEC-Like Metric Collection (5 Regs)")
+    print(f"Starting SPEC-Like Metric Collection (Normal / Full Regs)")
     
     # Write CSV Header
     with open(RESULTS_FILE, 'w', newline='') as f:
@@ -132,6 +126,7 @@ def main():
             exe_file = f"./{bench_name}_{alloc}"
             
             # 2. COMPILE TO ASM (To count instructions)
+            # STARVE_FLAGS is now empty, so this runs normally
             cmd_asm = (
                 f"{LLC_PATH} -O3 -regalloc={alloc} -filetype=asm "
                 f"{STARVE_FLAGS} "
