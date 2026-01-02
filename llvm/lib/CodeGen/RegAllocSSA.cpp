@@ -112,7 +112,7 @@ public:
   }
 
   // ADD THIS METHOD:
-  MachineFunctionProperties getSetProperties() const override {
+  MachineFunctionProperties getClearedProperties() const override {
     return MachineFunctionProperties().set(
       MachineFunctionProperties::Property::IsSSA);
   }
@@ -420,8 +420,12 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   // Final cleanup
   SpillerInstance.reset();
-  return true;
-}
+  
+  // FIX: Explicitly set NoPHIs. 
+  // This satisfies the downstream "Control Flow Optimizer" pass.
+  MF->getProperties().set(MachineFunctionProperties::Property::NoPHIs);
+
+  return true;}
 
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) { return new RASSA(); }
