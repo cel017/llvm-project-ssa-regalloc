@@ -10,7 +10,7 @@ CLANG_PATH = "clang"
 POLYBENCH_ROOT = "./polybench-c-4.2.1"
 RESULTS_FILE = "results_spec_metrics.csv"
 
-ALLOCATORS = ["basic", "greedy"]
+ALLOCATORS = ["ssa", "greedy"]
 
 # The "SPEC Equivalent" Suite
 BENCHMARKS = [
