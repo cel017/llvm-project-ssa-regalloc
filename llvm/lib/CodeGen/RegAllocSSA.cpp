@@ -176,7 +176,6 @@ float RASSA::getSpillWeight(Register Reg) {
   if (!LIS->hasInterval(Reg)) return 1.0e20f;
   
   const LiveInterval &LI = LIS->getInterval(Reg);
-  // FIX: Check if empty before querying properties
   if (LI.empty() || LI.isSpillable() == false) return 1.0e20f;
 
   float Weight = 0.0f;
@@ -201,7 +200,9 @@ MCRegister RASSA::getFreePhysReg(Register VReg, const RegClique &Clique) {
   ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
 
   for (MCPhysReg PhysReg : Order) {
-    if (!Clique.isOccupied(PhysReg) && 
+    // FIX: Check MRI->isReserved to prevent using reserved regs (like x3, sp)
+    if (!MRI->isReserved(PhysReg) && 
+        !Clique.isOccupied(PhysReg) && 
         Matrix->checkInterference(LIS->getInterval(VReg), PhysReg) == LiveRegMatrix::IK_Free) {
       return PhysReg;
     }
@@ -222,7 +223,6 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
     
     if (LIS->hasInterval(Reg)) {
       const LiveInterval &LI = LIS->getInterval(Reg);
-      // FIX: Check !LI.empty() before calling expiredAt() to prevent assertion failure
       if (!LI.empty() && LI.expiredAt(Idx)) {
         if (VRM->hasPhys(Reg)) {
           MCRegister Phys = VRM->getPhys(Reg);
@@ -304,7 +304,6 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
     if (!MRI->reg_nodbg_empty(Reg) && VRM->hasPhys(Reg)) {
       if (LIS->hasInterval(Reg)) {
         const LiveInterval &LI = LIS->getInterval(Reg);
-        // FIX: Check !LI.empty() before calling liveAt()
         if (!LI.empty() && LI.liveAt(BlockStart)) {
           Clique.occupy(VRM->getPhys(Reg));
         }
@@ -322,16 +321,12 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
 //===----------------------------------------------------------------------===//
 // Main Driver
 //===----------------------------------------------------------------------===//
-//===----------------------------------------------------------------------===//
-// Main Driver
-//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MF = &mf;
   TRI = MF->getSubtarget().getRegisterInfo();
   TII = MF->getSubtarget().getInstrInfo();
   MRI = &MF->getRegInfo();
   
-  // 1. Fetch Analyses
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
@@ -342,13 +337,11 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
-  // Initialize weights
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg)) continue;
     
     LiveInterval &LI = LIS->getInterval(Reg);
-    // FIX: Check !LI.empty()
     if (!LI.empty())
         LI.setWeight(getSpillWeight(Reg));
   }
@@ -367,17 +360,28 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     performLocalAllocation(*MBB, Clique);
   }
 
-  // FIX: Assign dummy registers to any unassigned VRegs (e.g., undefs)
-  // This prevents VirtRegRewriter from crashing on "Remaining virtual register".
+  // FIX: Assign dummy registers to unassigned VRegs (e.g., undefs).
+  // CRITICAL FIX: Use getRawAllocationOrder to find a NON-RESERVED register.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (!MRI->reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {
       const TargetRegisterClass *RC = MRI->getRegClass(Reg);
-      // Assign the first valid physical register from the class.
-      // Since it's undef/dead, the specific choice doesn't impact correctness,
-      // only architectural constraints (which RegClass handles).
-      if (RC->getNumRegs() > 0) {
-          VRM->assignVirt2Phys(Reg, *RC->begin());
+      
+      // Get the list of ALLOCATABLE registers (excludes reserved regs)
+      ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
+      
+      if (!Order.empty()) {
+          // Safe: Pick the first allocatable register
+          VRM->assignVirt2Phys(Reg, Order.front());
+      } else {
+          // Fallback: If allocation order is empty (rare, but possible for some classes),
+          // manually scan and check isReserved.
+          for (MCPhysReg PReg : *RC) {
+              if (!MRI->isReserved(PReg)) {
+                  VRM->assignVirt2Phys(Reg, PReg);
+                  break;
+              }
+          }
       }
     }
   }
