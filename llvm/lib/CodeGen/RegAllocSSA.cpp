@@ -424,24 +424,40 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   }
 
   // FIX: Assign dummy registers to unassigned VRegs to satisfy VirtRegRewriter.
-  // Use getRawAllocationOrder to ensure we only pick ALLOWED registers.
+  // Robustly find a NON-RESERVED register.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (!MRI->reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {
       const TargetRegisterClass *RC = MRI->getRegClass(Reg);
       
+      MCRegister FoundReg = 0;
+
+      // 1. Try Allocation Order first (preferred)
       ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
-      
-      if (!Order.empty()) {
-          VRM->assignVirt2Phys(Reg, Order.front());
-      } else {
-          // Fallback scan for any non-reserved register
-          for (MCPhysReg PReg : *RC) {
-              if (!MRI->isReserved(PReg)) {
-                  VRM->assignVirt2Phys(Reg, PReg);
-                  break;
-              }
+      for (MCPhysReg PReg : Order) {
+        if (!MRI->isReserved(PReg)) {
+          FoundReg = PReg;
+          break;
+        }
+      }
+
+      // 2. Fallback: Iterate the entire class if Order failed
+      if (!FoundReg) {
+        for (MCPhysReg PReg : *RC) {
+          if (!MRI->isReserved(PReg)) {
+            FoundReg = PReg;
+            break;
           }
+        }
+      }
+
+      // 3. Last Resort: Just take the first one (shouldn't happen on valid archs)
+      if (!FoundReg && RC->getNumRegs() > 0) {
+         FoundReg = *RC->begin();
+      }
+
+      if (FoundReg) {
+        VRM->assignVirt2Phys(Reg, FoundReg);
       }
     }
   }
