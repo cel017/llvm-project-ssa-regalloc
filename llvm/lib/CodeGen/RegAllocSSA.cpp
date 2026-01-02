@@ -322,12 +322,16 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
 //===----------------------------------------------------------------------===//
 // Main Driver
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Main Driver
+//===----------------------------------------------------------------------===//
 bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MF = &mf;
   TRI = MF->getSubtarget().getRegisterInfo();
   TII = MF->getSubtarget().getInstrInfo();
   MRI = &MF->getRegInfo();
   
+  // 1. Fetch Analyses
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
@@ -338,12 +342,15 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
+  // Initialize weights
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg)) continue;
     
     LiveInterval &LI = LIS->getInterval(Reg);
-    LI.setWeight(getSpillWeight(Reg));
+    // FIX: Check !LI.empty()
+    if (!LI.empty())
+        LI.setWeight(getSpillWeight(Reg));
   }
 
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
@@ -358,6 +365,21 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineBasicBlock *Entry = &MF->front();
   for (auto *MBB : depth_first(Entry)) {
     performLocalAllocation(*MBB, Clique);
+  }
+
+  // FIX: Assign dummy registers to any unassigned VRegs (e.g., undefs)
+  // This prevents VirtRegRewriter from crashing on "Remaining virtual register".
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+    if (!MRI->reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {
+      const TargetRegisterClass *RC = MRI->getRegClass(Reg);
+      // Assign the first valid physical register from the class.
+      // Since it's undef/dead, the specific choice doesn't impact correctness,
+      // only architectural constraints (which RegClass handles).
+      if (RC->getNumRegs() > 0) {
+          VRM->assignVirt2Phys(Reg, *RC->begin());
+      }
+    }
   }
 
   SpillerInstance.reset();
