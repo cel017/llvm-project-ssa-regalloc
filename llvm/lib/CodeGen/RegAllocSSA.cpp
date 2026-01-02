@@ -92,10 +92,8 @@ class RASSA : public MachineFunctionPass, private LiveRangeEdit::Delegate {
   
   std::unique_ptr<Spiller> SpillerInstance;
   
-  // The "Fernando" approach uses a visited set for the CFG traversal
   SmallPtrSet<MachineBasicBlock*, 32> Visited;
 
-  // Needed for LiveRangeEdit::Delegate (empty for now)
   void LRE_WillShrinkVirtReg(Register) override {}
   bool LRE_CanEraseVirtReg(Register) override { return false; }
 
@@ -105,13 +103,12 @@ public:
   RASSA() : MachineFunctionPass(ID) {}
 
   StringRef getPassName() const override { return "SSA Chordal Register Allocator"; }
-  
+
   MachineFunctionProperties getRequiredProperties() const override {
     return MachineFunctionProperties().set(
       MachineFunctionProperties::Property::IsSSA);
   }
 
-  // ADD THIS METHOD:
   MachineFunctionProperties getClearedProperties() const override {
     return MachineFunctionProperties().set(
       MachineFunctionProperties::Property::IsSSA);
@@ -123,24 +120,11 @@ public:
   bool runOnMachineFunction(MachineFunction &mf) override;
 
 private:
-  // --- The Core Fernando Logic Methods ---
-
-  /// Simulates 'perform_local_allocation' from CfgV_Fernando.cpp
   void performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique);
-
-  /// Simulates 'allocate_defs'
   void allocateDefs(MachineInstr &MI, RegClique &Clique);
-
-  /// Simulates 'liberate_dead_uses'
   void liberateDeadUses(MachineInstr &MI, RegClique &Clique);
-
-  /// Helper to calculate weight (10^depth)
   float getSpillWeight(Register Reg);
-
-  /// Spills a register using the modern Spiller
   void spill(Register VReg);
-
-  /// Tries to find a free physical register in the class
   MCRegister getFreePhysReg(Register VReg, const RegClique &Clique);
 };
 
@@ -170,9 +154,9 @@ void RASSA::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LiveRegMatrixWrapperLegacy>();
   AU.addRequired<MachineLoopInfoWrapperPass>();
   AU.addRequired<MachineDominatorTreeWrapperPass>();
-  AU.addRequired<LiveStacksWrapperLegacy>(); // Required for Spiller
-  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>(); // Required for VRAI
-  AU.addRequired<ProfileSummaryInfoWrapperPass>(); // Required for VRAI
+  AU.addRequired<LiveStacksWrapperLegacy>(); 
+  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>(); 
+  AU.addRequired<ProfileSummaryInfoWrapperPass>(); 
   AU.addPreserved<SlotIndexesWrapperPass>();
   AU.addPreserved<LiveIntervalsWrapperPass>();
   AU.addPreserved<VirtRegMapWrapperLegacy>();
@@ -185,35 +169,27 @@ void RASSA::releaseMemory() {
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: Weight Calculation (10^LoopDepth)
+// Helper: Weight Calculation
 //===----------------------------------------------------------------------===//
 float RASSA::getSpillWeight(Register Reg) {
   if (!Reg.isVirtual()) return 0.0f;
-  
-  // If LIS doesn't have it, we can't calculate exact weight, default to high.
   if (!LIS->hasInterval(Reg)) return 1.0e20f;
-
+  
   const LiveInterval &LI = LIS->getInterval(Reg);
-  if (LI.isSpillable() == false) return 1.0e20f;
+  // FIX: Check if empty before querying properties
+  if (LI.empty() || LI.isSpillable() == false) return 1.0e20f;
 
-  // The original Fernando algorithm used: 
-  // w = 1 + 10^depth(def) + sum(1 + 10^depth(use))
-  
   float Weight = 0.0f;
-  
-  // Def weight
   if (MRI->getVRegDef(Reg)) {
     MachineBasicBlock *DefMBB = MRI->getVRegDef(Reg)->getParent();
     unsigned Depth = MLI->getLoopDepth(DefMBB);
     Weight += std::pow(10.0f, (float)Depth);
   }
 
-  // Uses weight
   for (MachineInstr &UseMI : MRI->use_instructions(Reg)) {
     unsigned Depth = MLI->getLoopDepth(UseMI.getParent());
     Weight += std::pow(10.0f, (float)Depth) + 1.0f;
   }
-
   return Weight;
 }
 
@@ -237,9 +213,6 @@ MCRegister RASSA::getFreePhysReg(Register VReg, const RegClique &Clique) {
 // Logic: Liberate Dead Uses
 //===----------------------------------------------------------------------===//
 void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
-  // "After a virtual register is last used, the machine register assigned
-  // to it must be liberated."
-  
   SlotIndex Idx = LIS->getInstructionIndex(MI).getRegSlot();
 
   for (const MachineOperand &MO : MI.operands()) {
@@ -247,53 +220,37 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
     
     Register Reg = MO.getReg();
     
-    // Check if this is the last use.
     if (LIS->hasInterval(Reg)) {
       const LiveInterval &LI = LIS->getInterval(Reg);
-      // If the interval ends at this instruction (read slot), it's dead.
-      if (LI.expiredAt(Idx)) {
+      // FIX: Check !LI.empty() before calling expiredAt() to prevent assertion failure
+      if (!LI.empty() && LI.expiredAt(Idx)) {
         if (VRM->hasPhys(Reg)) {
           MCRegister Phys = VRM->getPhys(Reg);
           Clique.liberate(Phys);
-          
-          // FIX: DO NOT call Matrix->unassign(LI). 
-          // Unassigning clears the VirtRegMap, which causes the Rewriter to crash later.
-          // Matrix->checkInterference handles non-overlapping reuse naturally.
         }
       }
     }
   }
 }
-//===----------------------------------------------------------------------===//
-// Logic: Allocate Defs
-//===----------------------------------------------------------------------===//
+
 //===----------------------------------------------------------------------===//
 // Logic: Allocate Defs
 //===----------------------------------------------------------------------===//
 void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
-  // "This method assigns a valid physical register to the virtual register."
-  
-  // 1. Try Coalescing (Simple Move optimization from original code)
   if (MI.isCopy()) {
     Register Dest = MI.getOperand(0).getReg();
     Register Src = MI.getOperand(1).getReg();
     
     if (Dest.isVirtual()) {
       MCRegister SrcPhys = 0;
-      
-      // FIX: Handle both Physical and Virtual sources to avoid assertion
       if (Src.isPhysical()) {
         SrcPhys = Src.asMCReg();
       } else if (Src.isVirtual() && VRM->hasPhys(Src)) {
         SrcPhys = VRM->getPhys(Src);
       }
       
-      // If we found a valid physical source candidate
       if (SrcPhys) {
-        // Check if the physical register is free in the Clique and compatible with Dest
         if (!Clique.isOccupied(SrcPhys) && MRI->getRegClass(Dest)->contains(SrcPhys)) {
-          // Compatibility check passed, Coalesce!
-          // (In a real allocator, we'd check strict interference, here we trust the Clique + Matrix)
           if (Matrix->checkInterference(LIS->getInterval(Dest), SrcPhys) == LiveRegMatrix::IK_Free) {
              Matrix->assign(LIS->getInterval(Dest), SrcPhys);
              Clique.occupy(SrcPhys);
@@ -305,27 +262,19 @@ void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
     }
   }
 
-  // 2. Standard Allocation
   for (const MachineOperand &MO : MI.defs()) {
     if (!MO.isReg() || !MO.getReg().isVirtual()) continue;
     Register Reg = MO.getReg();
+    if (VRM->hasPhys(Reg)) continue;
 
-    if (VRM->hasPhys(Reg)) continue; // Already assigned (e.g., pre-colored or two-addr)
-
-    // Ensure Interval exists
     if (!LIS->hasInterval(Reg)) LIS->createAndComputeVirtRegInterval(Reg);
     
-    // Find free register
     MCRegister PhysReg = getFreePhysReg(Reg, Clique);
     
     if (PhysReg) {
       Matrix->assign(LIS->getInterval(Reg), PhysReg);
       Clique.occupy(PhysReg);
     } else {
-      // SPILL!
-      // In Fernando's original code, it would look for a neighbor in the clique to spill
-      // based on weight. For this port, we simplify by spilling the current definition.
-      // This is safe because 'spill' will split the interval and defer allocation.
       NumSpills++;
       spill(Reg); 
     }
@@ -347,26 +296,24 @@ void RASSA::spill(Register VReg) {
 void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
   Visited.insert(&MBB);
   
-  // 1. Initialize Clique at block entry
   Clique.clear();
   SlotIndex BlockStart = LIS->getMBBStartIdx(&MBB);
   
-  // Approximation: Iterate all VirtRegs that have been assigned a PhysReg so far.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (!MRI->reg_nodbg_empty(Reg) && VRM->hasPhys(Reg)) {
       if (LIS->hasInterval(Reg)) {
         const LiveInterval &LI = LIS->getInterval(Reg);
-        if (LI.liveAt(BlockStart)) {
+        // FIX: Check !LI.empty() before calling liveAt()
+        if (!LI.empty() && LI.liveAt(BlockStart)) {
           Clique.occupy(VRM->getPhys(Reg));
         }
       }
     }
   }
 
-  // 2. Linear Scan
   for (auto MII = MBB.begin(), MIE = MBB.end(); MII != MIE; ) {
-    MachineInstr &MI = *MII++; // Increment early in case of deletion via spill
+    MachineInstr &MI = *MII++; 
     liberateDeadUses(MI, Clique);
     allocateDefs(MI, Clique);
   }
@@ -381,7 +328,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   TII = MF->getSubtarget().getInstrInfo();
   MRI = &MF->getRegInfo();
   
-  // 1. Fetch Analyses
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   Matrix = &getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM();
@@ -392,7 +338,6 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
   MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
   ProfileSummaryInfo &PSI = getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
 
-  // Initialize weights
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (MRI->reg_nodbg_empty(Reg) || !LIS->hasInterval(Reg)) continue;
@@ -401,15 +346,12 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     LI.setWeight(getSpillWeight(Reg));
   }
 
-  // Initialize Spiller with VRAI
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, *MLI, MBFI, &PSI);
   
-  // FIX: Remove *MLI from the end. Struct layout is likely just {LIS, LS, MDT, MBFI}
   Spiller::RequiredAnalyses Analyses{*LIS, LS, *MDT, MBFI};
   
   SpillerInstance.reset(createInlineSpiller(Analyses, *MF, *VRM, VRAI, Matrix));
 
-  // Clear State
   Visited.clear();
   RegClique Clique(TRI);
   
@@ -418,14 +360,12 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     performLocalAllocation(*MBB, Clique);
   }
 
-  // Final cleanup
   SpillerInstance.reset();
-  
-  // FIX: Explicitly set NoPHIs. 
-  // This satisfies the downstream "Control Flow Optimizer" pass.
+
   MF->getProperties().set(MachineFunctionProperties::Property::NoPHIs);
 
-  return true;}
+  return true;
+}
 
 FunctionPass *llvm::createSSARegisterAllocator() { return new RASSA(); }
 FunctionPass *llvm::createSSARegisterAllocator(RegAllocFilterFunc F) { return new RASSA(); }
