@@ -244,9 +244,10 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
 }
 
 //===----------------------------------------------------------------------===//
-// Logic: Allocate Defs (With Eviction)
+// Logic: Allocate Defs
 //===----------------------------------------------------------------------===//
 void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
+  // 1. Try Coalescing
   if (MI.isCopy()) {
     Register Dest = MI.getOperand(0).getReg();
     Register Src = MI.getOperand(1).getReg();
@@ -260,7 +261,11 @@ void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
       }
       
       if (SrcPhys) {
-        if (!Clique.isOccupied(SrcPhys) && MRI->getRegClass(Dest)->contains(SrcPhys)) {
+        // FIX: Check !MRI->isReserved to ensure we don't assign Reserved Regs (like Zero)
+        if (!MRI->isReserved(SrcPhys) && 
+            !Clique.isOccupied(SrcPhys) && 
+            MRI->getRegClass(Dest)->contains(SrcPhys)) {
+          
           if (Matrix->checkInterference(LIS->getInterval(Dest), SrcPhys) == LiveRegMatrix::IK_Free) {
              Matrix->assign(LIS->getInterval(Dest), SrcPhys);
              Clique.occupy(Dest, SrcPhys);
@@ -272,6 +277,7 @@ void RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
     }
   }
 
+  // 2. Standard Allocation
   for (const MachineOperand &MO : MI.defs()) {
     if (!MO.isReg() || !MO.getReg().isVirtual()) continue;
     Register Reg = MO.getReg();
@@ -411,23 +417,33 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
 
   // FIX: Safe Cleanup Loop
   // Iterates the class to find ANY non-reserved register.
-  // REMOVED the blind fallback that caused the assertion failure.
+  // REMOVED the "Last Resort" fallback that blindly picked the first register.
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (!MRI->reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {
       const TargetRegisterClass *RC = MRI->getRegClass(Reg);
-      
       MCRegister FoundReg = 0;
 
-      // Scan class for any allocatable register
-      for (MCPhysReg PReg : *RC) {
+      // 1. Try Allocation Order
+      ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
+      for (MCPhysReg PReg : Order) {
         if (!MRI->isReserved(PReg)) {
           FoundReg = PReg;
           break;
         }
       }
 
-      // Only assign if we actually found a valid, non-reserved register
+      // 2. Fallback: Full class scan
+      if (!FoundReg) {
+        for (MCPhysReg PReg : *RC) {
+          if (!MRI->isReserved(PReg)) {
+            FoundReg = PReg;
+            break;
+          }
+        }
+      }
+
+      // If still not found, we simply leave it unassigned to avoid crashing.
       if (FoundReg) {
         VRM->assignVirt2Phys(Reg, FoundReg);
       }
