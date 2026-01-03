@@ -130,9 +130,10 @@ public:
 private:
   void performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique);
   
-  // Return true if spilled (signaling iterator reset needed)
+  // FIX: Helper to fix "Non-PHI after PHI" errors caused by spilling
+  void enforcePhiOrdering(MachineBasicBlock &MBB);
+
   bool allocateDefs(MachineInstr &MI, RegClique &Clique);
-  
   void liberateDeadUses(MachineInstr &MI, RegClique &Clique);
   float getSpillWeight(Register Reg);
   void spill(Register VReg);
@@ -229,9 +230,25 @@ void RASSA::liberateDeadUses(MachineInstr &MI, RegClique &Clique) {
   }
 }
 
+// FIX: New helper to keep PHIs at the top of the block
+void RASSA::enforcePhiOrdering(MachineBasicBlock &MBB) {
+  MachineBasicBlock::iterator PhiEnd = MBB.begin();
+  // Find the end of the current PHI sequence
+  while (PhiEnd != MBB.end() && PhiEnd->isPHI())
+    ++PhiEnd;
+  
+  // Scan the rest of the block. If we find a PHI (displaced by spill code), move it back.
+  for (auto I = PhiEnd; I != MBB.end(); ) {
+    auto MI = I++;
+    if (MI->isPHI()) {
+      MBB.splice(PhiEnd, &MBB, MI);
+      // 'PhiEnd' still points to the first non-PHI, effectively growing the PHI region
+    }
+  }
+}
+
 // Returns true if spilling occurred
 bool RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
-  // Coalescing optimization
   if (MI.isCopy()) {
     Register Dest = MI.getOperand(0).getReg();
     Register Src = MI.getOperand(1).getReg();
@@ -271,7 +288,6 @@ bool RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
       Matrix->assign(LI, PhysReg);
       Clique.occupy(Reg, PhysReg);
     } else {
-      // Eviction Logic
       Register BestVictim = 0;
       float BestWeight = LI.weight(); 
       MCRegister BestPhys = 0;
@@ -304,7 +320,6 @@ bool RASSA::allocateDefs(MachineInstr &MI, RegClique &Clique) {
         if (LI.isSpillable()) {
             NumSpills++;
             spill(Reg);
-            // Return TRUE to indicate spill happened, prompting iterator reset
             return true;
         }
       }
@@ -336,25 +351,23 @@ void RASSA::performLocalAllocation(MachineBasicBlock &MBB, RegClique &Clique) {
     }
   }
 
-  // FIX: Iterator loop supporting backtrack for spills
   for (auto MII = MBB.begin(); MII != MBB.end(); ) {
     MachineInstr &MI = *MII;
-    
-    // Save iterator to instruction BEFORE current
-    auto PrevMII = (MII == MBB.begin()) ? MBB.end() : std::prev(MII);
-    
     liberateDeadUses(MI, Clique);
     
     bool Spilled = allocateDefs(MI, Clique);
     
     if (Spilled) {
-      // Reset MII to the instruction after PrevMII (start of new/reload code)
-      if (PrevMII == MBB.end()) {
-        MII = MBB.begin();
-      } else {
-        MII = std::next(PrevMII);
-      }
-      continue; // Restart loop from new MII
+      // FIX: Ensure PHIs weren't separated by spill code
+      enforcePhiOrdering(MBB);
+      
+      // Safer reset: restart block scan to handle all new/moved instructions
+      MII = MBB.begin();
+      // Refill clique from scratch (expensive but safe) or rely on incremental update?
+      // For safety after spill+reorder, we should ideally re-evaluate the clique state
+      // but 'occupied' registers haven't changed status, only instructions moved.
+      // Restarting loop is sufficient.
+      continue;
     }
     
     ++MII;
@@ -396,16 +409,25 @@ bool RASSA::runOnMachineFunction(MachineFunction &mf) {
     performLocalAllocation(*MBB, Clique);
   }
 
-  // Final Safe Cleanup
+  // Safe Cleanup
   for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     Register Reg = Register::index2VirtReg(i);
     if (!MRI->reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {
       const TargetRegisterClass *RC = MRI->getRegClass(Reg);
       MCRegister FoundReg = 0;
-      for (MCPhysReg PReg : *RC) {
+      ArrayRef<MCPhysReg> Order = RC->getRawAllocationOrder(*MF);
+      for (MCPhysReg PReg : Order) {
         if (!MRI->isReserved(PReg)) {
           FoundReg = PReg;
           break;
+        }
+      }
+      if (!FoundReg) {
+        for (MCPhysReg PReg : *RC) {
+          if (!MRI->isReserved(PReg)) {
+            FoundReg = PReg;
+            break;
+          }
         }
       }
       if (FoundReg) VRM->assignVirt2Phys(Reg, FoundReg);
